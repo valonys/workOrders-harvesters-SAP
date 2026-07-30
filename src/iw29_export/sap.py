@@ -115,6 +115,14 @@ class SapSession:
     def set_text(self, element_id: str, value: str) -> None:
         self.find(element_id).text = value
 
+    def text(self, element_id: str) -> str:
+        try:
+            return str(self.find(element_id).text or "")
+        except SapError:
+            raise
+        except Exception:
+            return ""
+
     def set_checked(self, element_id: str, value: bool) -> None:
         self.find(element_id).selected = bool(value)
 

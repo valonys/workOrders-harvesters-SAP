@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .errors import ConfigError
+
+# SAP's own date entry format, including the open-ended 31.12.9999.
+_SAP_DATE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
 try:  # pragma: no cover - depends on interpreter version
     import tomllib
@@ -71,6 +75,28 @@ class RawStep:
 
 
 @dataclass
+class NotificationDateWindow:
+    """IW29's 'Notification date' pair.
+
+    These are two plain fields, not a select-option, so they cannot be driven by
+    [[selection.ranges]]. They are also the one thing a saved variant must not be
+    trusted with: a variant carries whatever dates it was saved with, which
+    silently drops notifications created since. Leaving `low` blank and `high` at
+    SAP's open-ended 31.12.9999 keeps the report open-ended, so anything newly
+    created is always picked up.
+    """
+
+    enabled: bool = True
+    low: str = ""
+    high: str = "31.12.9999"
+    field_low: str = "DATUV"
+    field_high: str = "DATUB"
+
+    def describe(self) -> str:
+        return f"{self.low or '<blank>'} to {self.high or '<blank>'}"
+
+
+@dataclass
 class SelectionConfig:
     transaction: str = "IW29"
     variant: str = ""
@@ -78,6 +104,9 @@ class SelectionConfig:
     lookback_days: int = 30
     date_from: str = ""
     date_to: str = ""
+    notification_date: NotificationDateWindow = field(
+        default_factory=NotificationDateWindow
+    )
     filters: List[Filter] = field(default_factory=list)
     ranges: List[Range] = field(default_factory=list)
     checkboxes: Dict[str, bool] = field(default_factory=dict)
@@ -300,6 +329,36 @@ def _build_sap(raw: Dict[str, Any]) -> SapConfig:
     )
 
 
+def _build_notification_date(raw: Dict[str, Any]) -> NotificationDateWindow:
+    entry = raw.get("notification_date", {})
+    if not isinstance(entry, dict):
+        raise ConfigError("[selection.notification_date] must be a table.")
+    defaults = NotificationDateWindow()
+    window = NotificationDateWindow(
+        enabled=_bool(entry, "selection.notification_date.enabled", defaults.enabled),
+        low=_str(entry, "selection.notification_date.from", defaults.low).strip(),
+        high=_str(entry, "selection.notification_date.to", defaults.high).strip(),
+        field_low=_str(
+            entry, "selection.notification_date.field_from", defaults.field_low
+        ).strip().upper(),
+        field_high=_str(
+            entry, "selection.notification_date.field_to", defaults.field_high
+        ).strip().upper(),
+    )
+    for label, value in (("from", window.low), ("to", window.high)):
+        if value and not _SAP_DATE.match(value):
+            raise ConfigError(
+                f"selection.notification_date.{label} must be blank or a SAP date "
+                f"like 31.12.9999, not {value!r}."
+            )
+    if window.enabled and not (window.field_low and window.field_high):
+        raise ConfigError(
+            "selection.notification_date needs both field_from and field_to, or "
+            "set enabled = false."
+        )
+    return window
+
+
 def _build_selection(raw: Dict[str, Any]) -> SelectionConfig:
     filters = []
     for entry in _list_of_tables(raw, "selection.filters"):
@@ -346,6 +405,7 @@ def _build_selection(raw: Dict[str, Any]) -> SelectionConfig:
         raise ConfigError("[selection.checkboxes] must be a table of name = true/false.")
 
     return SelectionConfig(
+        notification_date=_build_notification_date(raw),
         transaction=_str(raw, "selection.transaction", "IW29").strip().upper(),
         variant=_str(raw, "selection.variant", "").strip(),
         layout=_str(raw, "selection.layout", "").strip(),

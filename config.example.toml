@@ -29,6 +29,24 @@ lookback_days = 30           # used when date_from/date_to are blank
 date_from = ""               # "2026-07-01" or blank
 date_to = ""                 # "2026-07-30" or blank
 
+# IW29's "Notification date" is a pair of plain fields, not a select-option, so
+# it is configured here rather than under [[selection.ranges]].
+#
+# This is applied *after* the variant, deliberately. A variant carries whatever
+# dates it was saved with, so trusting it means the report quietly stops covering
+# notifications created since. The defaults below - blank "from", SAP's
+# open-ended 31.12.9999 "to" - leave the report unrestricted, so anything newly
+# created is always included. Both fields are read back after being set, and the
+# run fails rather than exporting a narrower set than you asked for.
+#
+# Set enabled = false to leave the variant's own dates alone.
+[selection.notification_date]
+enabled = true
+from = ""
+to = "31.12.9999"
+field_from = "DATUV"
+field_to = "DATUB"
+
 # Single-value or list selections. `field` is the ABAP select-option name from
 # the selection screen; run the recorder once (Alt+F12) to confirm names.
 [[selection.filters]]
@@ -40,9 +58,10 @@ field = "ARBPL"              # main work centre
 values = ["MECH01", "ELEC02"]
 
 # Ranges map to the LOW/HIGH pair of a select-option. {date_from}/{date_to}
-# are substituted from the dates resolved above.
+# are substituted from the dates resolved above. Note this is for real
+# select-options; the notification date is not one, see above.
 [[selection.ranges]]
-field = "QMDAT"              # notification date
+field = "ERDAT"              # created on
 low = "{date_from}"
 high = "{date_to}"
 

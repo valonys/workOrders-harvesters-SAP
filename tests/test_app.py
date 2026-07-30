@@ -49,6 +49,14 @@ log_folder = '{logs}'
 """
 
 
+def load_config_from_text(body: str) -> Config:
+    """Load a minimal config plus whatever section a test cares about."""
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / "config.toml"
+        path.write_text(f"[sap]\nsystem = 'FR3'\n\n{body}", encoding="utf-8")
+        return Config.load(path)
+
+
 def _write_config(folder: Path) -> Path:
     export_folder = folder / "sync"
     config_path = folder / "config.toml"
@@ -72,6 +80,26 @@ class ConfigTests(unittest.TestCase):
         date_from, date_to = config.selection.resolved_dates(date(2026, 7, 30))
         self.assertEqual(date_to, "30.07.2026")
         self.assertEqual(date_from, "16.07.2026")
+
+    def test_notification_dates_default_to_open_ended(self):
+        cfg = load_config_from_text("")
+        window = cfg.selection.notification_date
+        self.assertTrue(window.enabled)
+        self.assertEqual(window.low, "")
+        self.assertEqual(window.high, "31.12.9999")
+        self.assertEqual((window.field_low, window.field_high), ("DATUV", "DATUB"))
+
+    def test_notification_dates_can_be_narrowed(self):
+        cfg = load_config_from_text(
+            "[selection.notification_date]\nfrom = '01.01.2026'\nto = '31.12.2026'\n"
+        )
+        window = cfg.selection.notification_date
+        self.assertEqual(window.low, "01.01.2026")
+        self.assertEqual(window.describe(), "01.01.2026 to 31.12.2026")
+
+    def test_notification_date_rejects_iso_format(self):
+        with self.assertRaises(ConfigError):
+            load_config_from_text("[selection.notification_date]\nto = '2026-12-31'\n")
 
     def test_bad_export_mode_is_rejected(self):
         with tempfile.TemporaryDirectory() as scratch:

@@ -107,6 +107,20 @@ version). The parts worth understanding:
 SAP then owns the criteria and no screen field id can drift underneath the
 script. Filters in the config are applied on top of the variant.
 
+**But never let the variant own the dates.** A variant carries whatever
+notification dates it was saved with, so a feed that trusts it quietly stops
+covering anything created since — the kind of bug that shows up as a KPI drifting
+rather than as an error. `[selection.notification_date]` is therefore applied
+*after* the variant and defaults to open-ended: blank `from`, SAP's `31.12.9999`
+`to`. Both fields are read back off the screen afterwards and the run fails if
+SAP did not take them, so a narrower export cannot happen silently. `check`
+reports the window, and every run logs it.
+
+Note this is the *notification* date. If a variant also restricted `ERDAT`
+(Created On) or similar, opening this window would not help, so it is worth
+confirming against the data once: the exported `Created On` values should reach
+up to today.
+
 **Filters are data, not code.** Each `[[selection.filters]]` names an ABAP
 select-option and its values. One value goes straight into the `-LOW` field;
 several are loaded through the multiple-selection dialog via the clipboard,

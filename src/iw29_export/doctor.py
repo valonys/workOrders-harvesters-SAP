@@ -51,6 +51,7 @@ def run(config: Config) -> List[Check]:
     checks.append(_writable(config.staging_folder, "Staging folder"))
     checks.append(_writable(config.log_folder, "Log folder"))
     checks.append(_selection(config))
+    checks.append(_notification_dates(config))
     return checks
 
 
@@ -183,8 +184,7 @@ def _onedrive(folder: Path) -> Check:
 
 def _selection(config: Config) -> Check:
     selection = config.selection
-    date_from, date_to = selection.resolved_dates()
-    described = [f"{date_from} to {date_to}"]
+    described = []
     if selection.variant:
         described.append(f"variant {selection.variant}")
     filters = sum(1 for item in selection.filters if item.values)
@@ -196,3 +196,32 @@ def _selection(config: Config) -> Check:
             "no variant and no filters, so the report will run wide open",
         )
     return Check("Selection criteria", OK, ", ".join(described))
+
+
+def _notification_dates(config: Config) -> Check:
+    window = config.selection.notification_date
+    if not window.enabled:
+        return Check(
+            "Notification dates",
+            WARN,
+            "left to the variant, so notifications created after the variant was "
+            "saved may be missed",
+        )
+    if window.low:
+        return Check(
+            "Notification dates",
+            WARN,
+            f"lower bound {window.low} set, so notifications before it are excluded",
+        )
+    if window.high != "31.12.9999":
+        return Check(
+            "Notification dates",
+            WARN,
+            f"upper bound {window.high} is not open-ended, so recent notifications "
+            "may be missed",
+        )
+    return Check(
+        "Notification dates",
+        OK,
+        f"open-ended ({window.describe()}), so new notifications are always captured",
+    )

@@ -143,6 +143,9 @@ class SapIw29Source(ReportSource):
     def apply_selection(self, session: SapSession, progress: ProgressFn) -> None:
         self._apply_variant(session, progress)
         self._apply_layout(session)
+        # After the variant on purpose: the variant carries the dates it was saved
+        # with, and those must not decide what this report covers.
+        self._apply_notification_dates(session)
         self._apply_filters(session, progress)
         self._apply_checkboxes(session)
         self._apply_raw_steps(session)
@@ -250,6 +253,53 @@ class SapIw29Source(ReportSource):
             "selection.layout='%s'. Add it under [[selection.raw]] if it matters.",
             layout,
         )
+
+    def _apply_notification_dates(self, session: SapSession) -> None:
+        window = self.config.selection.notification_date
+        if not window.enabled:
+            log.info("Leaving the notification date fields as the variant set them.")
+            return
+
+        written = []
+        for field_name, value in (
+            (window.field_low, self._expand(window.low)),
+            (window.field_high, self._expand(window.high)),
+        ):
+            element_id = self._plain_field(session, field_name)
+            if element_id is None:
+                raise SapError(
+                    f"The notification date field {field_name} is not on the "
+                    f"{self.config.selection.transaction} selection screen. Run "
+                    "'iw29-export inspect' to find its id, then correct "
+                    "selection.notification_date.field_from/field_to."
+                )
+            session.set_text(element_id, value)
+            written.append((field_name, element_id, value))
+
+        # Read the fields back, so the log proves what SAP was actually asked for
+        # rather than what we intended. This feeds a KPI, so it has to be checkable.
+        for field_name, element_id, value in written:
+            actual = session.text(element_id)
+            if actual.strip() != value.strip():
+                raise SapError(
+                    f"Set {field_name} to {value or '<blank>'} but the screen shows "
+                    f"{actual or '<blank>'}. The variant or a user exit may be "
+                    "overwriting it."
+                )
+        log.info(
+            "Notification date window: %s to %s (%s / %s)",
+            written[0][2] or "<blank>",
+            written[1][2] or "<blank>",
+            window.field_low,
+            window.field_high,
+        )
+
+    def _plain_field(self, session: SapSession, field_name: str) -> Optional[str]:
+        for prefix in _FIELD_PREFIXES:
+            element_id = f"wnd[0]/usr/{prefix}{field_name}"
+            if session.exists(element_id):
+                return element_id
+        return None
 
     def _apply_filters(self, session: SapSession, progress: ProgressFn) -> None:
         for item in self.config.selection.filters:
