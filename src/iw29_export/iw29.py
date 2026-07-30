@@ -42,6 +42,13 @@ _LAYOUT_FIELD_CANDIDATES = (
 
 _GET_VARIANT_BUTTON = "wnd[0]/tbar[1]/btn[17]"
 
+# The single-values grid of the multiple-selection dialog, and its "Copy" button.
+_MULTI_TABLE_ROW = (
+    "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/"
+    "tblSAPLALDBSINGLE/ctxtRSCSEL_255-SLOW_I[1,{row}]"
+)
+_MULTI_COPY_BUTTON = "wnd[1]/tbar[0]/btn[8]"
+
 # Save-list dialog. btn[11] is "Generate"; btn[0] is the fallback on older kernels.
 _SAVE_DIALOG_PATH = "wnd[1]/usr/ctxtDY_PATH"
 _SAVE_DIALOG_FILENAME = "wnd[1]/usr/ctxtDY_FILENAME"
@@ -190,7 +197,7 @@ class SapIw29Source(ReportSource):
             self._fill_multiple_selection(session, item.field_name, values, progress)
 
         for item in self.config.selection.ranges:
-            low, high = self._resolve_range(item.low), self._resolve_range(item.high)
+            low, high = self._expand(item.low), self._expand(item.high)
             if low:
                 session.set_text(self._selection_field(session, item, "-LOW"), low)
             if high:
@@ -198,9 +205,10 @@ class SapIw29Source(ReportSource):
             if low or high:
                 log.info("Range %s = %s .. %s", item.field_name, low or "*", high or "*")
 
-    def _resolve_range(self, template: str) -> str:
-        if not template:
-            return ""
+    def _expand(self, template: str) -> str:
+        """Substitute {date_from}, {date_to} and {today} in a configured value."""
+        if not template or "{" not in template:
+            return template
         date_from, date_to = self.config.selection.resolved_dates()
         return template.format(
             date_from=date_from,
@@ -242,16 +250,16 @@ class SapIw29Source(ReportSource):
             )
         progress(f"Loading {len(values)} values into {field_name}.")
         session.press(button)
-        set_clipboard_text("\r\n".join(values))
 
         paste_button = "wnd[1]/tbar[0]/btn[24]"
-        if not session.exists(paste_button):
-            raise SapError(
-                "The multiple-selection dialog has no 'Upload from clipboard' button "
-                f"on this release, so {field_name} cannot be filled automatically."
-            )
-        session.press(paste_button)
-        session.press("wnd[1]/tbar[0]/btn[8]")
+        if session.exists(paste_button):
+            set_clipboard_text("\r\n".join(values))
+            session.press(paste_button)
+        else:
+            log.info("No clipboard upload button; typing the values instead.")
+            _type_multiple_selection(session, field_name, values)
+
+        session.press(_MULTI_COPY_BUTTON)
         session.raise_on_error()
 
     def _apply_checkboxes(self, session: SapSession) -> None:
@@ -267,7 +275,7 @@ class SapIw29Source(ReportSource):
         for step in self.config.selection.raw:
             log.info("Raw step %s on %s", step.action, step.element_id)
             if step.action == "set_text":
-                session.set_text(step.element_id, step.value)
+                session.set_text(step.element_id, self._expand(step.value))
             elif step.action == "set_checked":
                 session.set_checked(
                     step.element_id, str(step.value).strip().lower() in {"", "true", "1", "yes"}
@@ -392,6 +400,21 @@ class SapIw29Source(ReportSource):
         session.raise_on_error()
 
 
+def _type_multiple_selection(
+    session: SapSession, field_name: str, values: List[str]
+) -> None:
+    """Fallback for releases without the clipboard button: fill the grid rows."""
+    for index, value in enumerate(values):
+        element_id = _MULTI_TABLE_ROW.format(row=index)
+        if not session.exists(element_id):
+            raise SapError(
+                f"Only {index} of {len(values)} values for {field_name} fit in the "
+                "visible rows of the multiple-selection dialog. Put these values in a "
+                "saved variant instead, and set selection.variant."
+            )
+        session.set_text(element_id, value)
+
+
 def _grid_context_export(grid: Any, context_item: str) -> None:
     try:
         grid.pressToolbarContextButton("&MB_EXPORT")
@@ -418,24 +441,40 @@ def _grid_row_count(grid: Optional[Any]) -> Optional[int]:
 
 
 def _radio_buttons(session: SapSession) -> List[tuple]:
-    """Enumerate the radio buttons of the active popup as (id, label) pairs."""
+    """Enumerate the radio buttons of the active popup as (id, label) pairs.
+
+    The "Select Spreadsheet" dialog nests its options inside
+    subSUBSCREEN_STEPLOOP:SAPLSPO5:0150, so this has to walk the tree rather
+    than look at the direct children of wnd[1]/usr.
+    """
     container = session.optional("wnd[1]/usr")
     if container is None:
         return []
-    try:
-        count = int(container.Children.Count)
-    except Exception:
-        return []
     found: List[tuple] = []
+    _collect_radio_buttons(container, found, depth=0)
+    return found
+
+
+def _collect_radio_buttons(node: Any, found: List[tuple], depth: int) -> None:
+    if depth > 8:
+        return
+    try:
+        count = int(node.Children.Count)
+    except Exception:
+        return
     for index in range(count):
         try:
-            child = container.Children(index)
-            if str(child.Type) != "GuiRadioButton":
-                continue
-            found.append((_relative_id(str(child.Id)), str(child.Text or "")))
+            child = node.Children(index)
+            kind = str(child.Type)
         except Exception:
             continue
-    return found
+        if kind == "GuiRadioButton":
+            try:
+                found.append((_relative_id(str(child.Id)), str(child.Text or "")))
+            except Exception:
+                continue
+        else:
+            _collect_radio_buttons(child, found, depth + 1)
 
 
 def _relative_id(element_id: str) -> str:

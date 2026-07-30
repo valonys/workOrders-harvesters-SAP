@@ -32,22 +32,47 @@ one-window desktop UI for ad-hoc runs and a CLI for Task Scheduler.
   uses the standard library, so there is no Excel or `openpyxl` dependency.
   `requirements-optional.txt` covers the two optional features.
 
-## Quick start
+## How to launch it
+
+**The desktop app.** Double-click `launch_app.cmd` in the project folder. It
+sets up the import path, opens the window, and only leaves a console behind if
+something fails. For a Desktop icon instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create_shortcut.ps1
+```
+
+That puts "SAP IW29 export" on your Desktop, running through `pythonw.exe` so no
+console appears at all. `-Remove` deletes it again.
+
+Nothing happens to SAP until you press **Run export**, so it is safe to open and
+look around. Tick **Mock mode** to rehearse the whole flow against generated
+data.
+
+**From a terminal**, in the project folder:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"            # once per terminal session
+python -m iw29_export check             # pre-flight, touches nothing
+python -m iw29_export --mock            # full run against generated data
+python -m iw29_export run               # the real thing
+python -m iw29_export gui               # same window as launch_app.cmd
+```
+
+`scripts\run_export.cmd` sets `PYTHONPATH` itself, so
+`.\scripts\run_export.cmd run --days 7` works from anywhere. `pip install -e .`
+also removes the need for `PYTHONPATH` and gives you an `iw29-export` command.
+
+### First-time setup
 
 ```powershell
 pip install -r requirements.txt
 copy config.example.toml config.toml   # then edit it
-python -m iw29_export check            # pre-flight, touches nothing
-python -m iw29_export --mock           # full run against generated data
-python -m iw29_export run              # the real thing
+python -m iw29_export check
 ```
 
-Double-click `run_gui.pyw` for the desktop app, or run
-`python -m iw29_export gui`.
-
-If you run from a clone rather than an install, either `pip install -e .` or set
-`PYTHONPATH` to the `src` folder. `scripts\run_export.cmd` does the latter for
-you.
+Watch the first real run. SAP GUI is visible while it works, and if a screen id
+does not match, the log names the element so you can correct it.
 
 ## Commands
 
@@ -115,7 +140,14 @@ value = "M2"
 ```
 
 `action` can be `set_text`, `set_checked`, `press`, `select` or `send_vkey`.
-These steps run last, after the variant and the declarative filters.
+These steps run last, after the variant and the declarative filters, and their
+values understand `{date_from}`, `{date_to}` and `{today}`.
+
+A recording is also the fastest way to learn your own field names. From
+`iw29_kpi_AI.vbs` on this system, for example: the ALV layout field is
+`ctxtVARIANT`, the dates are plain fields `ctxtDATUV`/`ctxtDATUB` rather than a
+select-option pair, notification type is `QMART`, functional location is
+`STRNO`, description is `QMNAM`, and the status flag used is `DY_RST`.
 
 ## Scheduling
 
