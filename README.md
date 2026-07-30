@@ -24,8 +24,15 @@ one-window desktop UI for ad-hoc runs and a CLI for Task Scheduler.
 - Windows, Python 3.9 or newer (tested on 3.11).
 - SAP GUI for Windows with scripting enabled:
   `SAP Logon > Options > Accessibility & Scripting > Scripting > Enable scripting`.
-  Untick both notification options, otherwise every run shows a confirmation
-  popup.
+  Untick **both** notification options. This matters more than it sounds: with
+  them on, SAP puts up a confirmation popup that blocks the COM call until
+  somebody clicks it, so an unattended run does not fail — it hangs forever.
+- `sap.connection_name` in the config must be the SAP Logon entry *description*,
+  not the three letter system id. The id is enough to reuse a session you already
+  have open, but opening a new one needs the full name, e.g.
+  `05 - Africa - Angola - FR3 - Unisup Ecc6 Production`. If your connection list
+  is served centrally, the names live in the landscape XML referenced by
+  `HKCU:\Software\SAP\SAPLogon\Options\LandscapeFileOnServer`.
 - Server-side: profile parameter `sapgui/user_scripting = TRUE`. Your Basis team
   sets this; the app tells you clearly if it is off.
 - `pip install -r requirements.txt` — that is `pywin32` only. The workbook writer
@@ -143,11 +150,22 @@ value = "M2"
 These steps run last, after the variant and the declarative filters, and their
 values understand `{date_from}`, `{date_to}` and `{today}`.
 
-A recording is also the fastest way to learn your own field names. From
-`iw29_kpi_AI.vbs` on this system, for example: the ALV layout field is
-`ctxtVARIANT`, the dates are plain fields `ctxtDATUV`/`ctxtDATUB` rather than a
-select-option pair, notification type is `QMART`, functional location is
-`STRNO`, description is `QMNAM`, and the status flag used is `DY_RST`.
+Better still, let the app tell you:
+
+```powershell
+python -m iw29_export inspect
+```
+
+That opens the transaction, walks the live screen, and writes every element id
+with its label and tooltip to `logs\screen_dump.txt` — toolbar buttons, menu
+paths and all selection fields. It is quicker and more complete than reading a
+recording, because it shows what each id *does*.
+
+On FR3 it confirmed: the ALV layout field is `ctxtVARIANT`; the dates are plain
+fields `ctxtDATUV`/`ctxtDATUB`, not a select-option pair; `QMART` is Notification
+type, `STRNO` Functional Location, `QMTXT` Description, `QMNAM` Reported by,
+`ARBPL` Main work center; and the status checkboxes are `DY_OFN` Outstanding,
+`DY_IAR` In process, `DY_MAB` Completed, `DY_RST` Postponed.
 
 ## Scheduling
 
@@ -172,6 +190,28 @@ C:\Users\<you>\OneDrive - <Company>\IW29\
 └── archive\
     └── 2026\07\IW29_FR3_20260701.xlsx
 ```
+
+## How the export gets out of SAP
+
+Several buttons on an ALV result screen look like "export", and most of them are
+dead ends for a script. On FR3 the `Spreadsheet (Shift+F4)` button — the one a
+recording shows you pressing — takes the XXL route, which hands the data to
+Excel and never offers a filename a script can set. The route that works is the
+menu `List > Save > File...`, which gives the classic format dialog followed by
+`DY_PATH`/`DY_FILENAME`.
+
+Because that varies by system, the app does not hardcode one route. It tries the
+grid context codes, `%PC`, the save menus (matched by *label*, not by index,
+since menu numbering shifts between screens) and finally any toolbar button
+whose tooltip looks like an export. Each candidate is followed only as far as
+needed to see whether it produced the local-file dialog; if it leads to the
+Excel route instead, the popups are cancelled and the next candidate is tried.
+The chosen route is written to the log, so a run tells you what worked.
+
+The resulting download is not a plain CSV. IW29 writes a page title, blank
+lines, a header, and rows that all begin with a tab, so the parser finds the
+header by looking for the dominant separator rather than trusting line 1, drops
+the empty leading column, and ignores headers repeated at page breaks.
 
 ## Why not the single-script version
 

@@ -24,6 +24,8 @@ _ENCODING_CANDIDATES = ("utf-8-sig", "utf-16", "cp1252", "latin-1")
 _DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y%m%d")
 _SEPARATOR_LINE = re.compile(r"^[\s|+\-=_]*$")
 _NUMBER_LIKE = re.compile(r"^-?[\d.,\s]+-?$")
+_SEPARATORS = ("\t", "|", ";")
+_PREAMBLE_LIMIT = 30
 
 
 @dataclass
@@ -45,25 +47,33 @@ def read_sap_text(path: Path) -> Table:
     if not lines:
         raise ExportError(f"{path.name} contains no usable rows.")
 
-    if "\t" in lines[0]:
-        raw_rows = [next(csv.reader([line], delimiter="\t")) for line in lines]
-    elif "|" in lines[0]:
-        raw_rows = [[cell.strip() for cell in line.strip().strip("|").split("|")] for line in lines]
-    elif ";" in lines[0]:
-        raw_rows = [next(csv.reader([line], delimiter=";")) for line in lines]
-    else:
-        raise ExportError(
-            f"Could not work out the column separator in {path.name}. Expected tab, "
-            "pipe or semicolon on the first line."
+    separator, header_index = _find_header(lines, path.name)
+    if header_index:
+        log.info(
+            "Skipped %d preamble line(s) before the header, e.g. %r",
+            header_index,
+            lines[0][:60].strip(),
         )
 
-    headers = _clean_headers(raw_rows[0])
+    raw_rows = [_split(line, separator) for line in lines[header_index:]]
+    header_cells = raw_rows[0]
+    drop_first = _has_empty_lead_column(raw_rows)
+    if drop_first:
+        raw_rows = [row[1:] for row in raw_rows]
+        header_cells = raw_rows[0]
+
+    headers = _clean_headers(header_cells)
     width = len(headers)
+    header_signature = [cell.strip() for cell in header_cells]
+
     rows: List[List[Any]] = []
     for raw in raw_rows[1:]:
         cells = [str(cell).strip() for cell in raw[:width]]
         cells += [""] * (width - len(cells))
         if not any(cells):
+            continue
+        # Long lists repeat the page title and header at each page break.
+        if cells == header_signature:
             continue
         rows.append([coerce(cell) for cell in cells])
 
@@ -71,6 +81,41 @@ def read_sap_text(path: Path) -> Table:
         raise ExportError(f"{path.name} has a header but no data rows.")
     log.info("Parsed %d data rows across %d columns", len(rows), width)
     return Table(headers=headers, rows=rows)
+
+
+def _find_header(lines: Sequence[str], name: str) -> Tuple[str, int]:
+    """Locate the header row and its separator.
+
+    SAP puts a page title and blank lines above the data, so the separator
+    cannot be read off the first line. The header is the first line that is
+    actually split into several columns.
+    """
+    window = lines[:_PREAMBLE_LIMIT]
+    totals = {sep: sum(line.count(sep) for line in window) for sep in _SEPARATORS}
+    separator = max(_SEPARATORS, key=lambda candidate: totals[candidate])
+    if totals[separator]:
+        for index, line in enumerate(window):
+            if separator in line:
+                return separator, index
+    raise ExportError(
+        f"Could not work out the column separator in {name}. Expected tab, pipe or "
+        f"semicolon in the first {_PREAMBLE_LIMIT} lines. If SAP wrote a fixed-width "
+        "list, re-run so the 'Text with Tabs' format is chosen."
+    )
+
+
+def _split(line: str, separator: str) -> List[str]:
+    if separator == "|":
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return next(csv.reader([line], delimiter=separator))
+
+
+def _has_empty_lead_column(raw_rows: Sequence[Sequence[str]]) -> bool:
+    """SAP's tab export starts every line with a tab, giving a blank first column."""
+    sample = raw_rows[: min(len(raw_rows), 50)]
+    return len(sample) > 1 and all(
+        row and not str(row[0]).strip() for row in sample
+    )
 
 
 def read_xlsx(path: Path) -> Table:

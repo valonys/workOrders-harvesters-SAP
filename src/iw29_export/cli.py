@@ -16,12 +16,21 @@ from .logging_setup import get_logger
 log = get_logger("cli")
 
 
-COMMANDS = ("run", "check", "archive", "gui", "store-password", "forget-password")
+COMMANDS = (
+    "run",
+    "check",
+    "inspect",
+    "archive",
+    "gui",
+    "store-password",
+    "forget-password",
+)
 
 _EPILOG = """\
 commands:
   run                 export the report (default when no command is given)
   check               verify SAP, folders and credentials without running anything
+  inspect             open the transaction and dump the real screen element ids
   archive             only file away old reports
   gui                 open the desktop app
   store-password      save the SAP password in Windows Credential Manager
@@ -65,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true", help="archive command only: change nothing"
     )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="inspect command only: run the report first and dump the result screen",
+    )
     return parser
 
 
@@ -86,6 +100,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     handlers = {
         "run": _command_run,
         "check": _command_check,
+        "inspect": _command_inspect,
         "archive": _command_archive,
         "gui": _command_gui,
         "store-password": _command_store_password,
@@ -167,6 +182,19 @@ def _command_check(config: Config, args: argparse.Namespace) -> int:
     )
     del args
     return 0 if verdict != doctor.FAIL else 2
+
+
+def _command_inspect(config: Config, args: argparse.Namespace) -> int:
+    from .screen_dump import dump
+
+    execute = bool(getattr(args, "execute", False))
+    text = dump(config, execute=execute)
+    name = "screen_dump_result.txt" if execute else "screen_dump.txt"
+    destination = config.log_folder / name
+    destination.write_text(text, encoding="utf-8")
+    print(text)
+    print(f"\nSaved to {destination}")
+    return 0
 
 
 def _command_archive(config: Config, args: argparse.Namespace) -> int:

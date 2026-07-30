@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 from .errors import LockError
 from .logging_setup import get_logger
@@ -51,15 +52,43 @@ def exclusive(lock_path: Path, timeout_s: int = 0) -> Iterator[Path]:
 
 
 def _clear_if_stale(lock_path: Path) -> bool:
+    """Remove the lock if the process that wrote it has gone, or it is ancient."""
     try:
         age = time.time() - lock_path.stat().st_mtime
     except OSError:
         return True
-    if age < STALE_AFTER_S:
+
+    holder = _recorded_pid(lock_path)
+    if holder is not None and not _process_alive(holder):
+        log.warning("Lock was held by process %d, which no longer exists.", holder)
+    elif age < STALE_AFTER_S:
         return False
-    log.warning("Removing a stale lock file (%.0f minutes old).", age / 60)
+    else:
+        log.warning("Removing a stale lock file (%.0f minutes old).", age / 60)
+
     try:
         lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _recorded_pid(lock_path: Path) -> Optional[int]:
+    try:
+        text = lock_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"pid=(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
         return True
     except OSError:
         return False

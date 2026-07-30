@@ -11,10 +11,14 @@ from .config import Config
 from .errors import EmptyResultError, ExportError, SapError
 from .logging_setup import get_logger
 from .sap import (
+    VKEY_CHOOSE,
     VKEY_ENTER,
     VKEY_EXECUTE,
+    VKEY_F12_CANCEL,
+    VKEY_GET_VARIANT,
     SapGui,
     SapSession,
+    relative_id,
     set_clipboard_text,
 )
 from .source import Extract, ProgressFn, ReportSource
@@ -40,7 +44,12 @@ _LAYOUT_FIELD_CANDIDATES = (
     "wnd[0]/usr/ctxtDY_LAYOUT",
 )
 
+# Confirmed on FR3: tbar[1]/btn[17] is "Get Variant... (Shift+F5)", and the same
+# action is on the menu at Goto > Variants > Get...
 _GET_VARIANT_BUTTON = "wnd[0]/tbar[1]/btn[17]"
+_GET_VARIANT_MENU = "wnd[0]/mbar/menu[2]/menu[0]/menu[0]"
+_VARIANT_NAME_FIELD = "wnd[1]/usr/txtV-LOW"
+_VARIANT_OWNER_FIELD = "wnd[1]/usr/txtENAME-LOW"
 
 # The single-values grid of the multiple-selection dialog, and its "Copy" button.
 _MULTI_TABLE_ROW = (
@@ -48,6 +57,26 @@ _MULTI_TABLE_ROW = (
     "tblSAPLALDBSINGLE/ctxtRSCSEL_255-SLOW_I[1,{row}]"
 )
 _MULTI_COPY_BUTTON = "wnd[1]/tbar[0]/btn[8]"
+
+# Ways to reach "save the list to a local file", by menu label rather than index.
+_EXPORT_MENU_PATHS = (
+    # IW29's ALV list on FR3 puts it here; "Spreadsheet" next to it is the XXL
+    # route that ends in Excel, so label matching has to be exact.
+    ("List", "Save", "File"),
+    ("List", "Save", "Local File"),
+    ("System", "List", "Save", "Local File"),
+    ("List", "Export", "Local File"),
+    ("List", "Save/Send", "File"),
+)
+_EXPORT_TOOLTIP_WORDS = ("local file", "spreadsheet", "export", "download")
+
+# Dialog text that means SAP is about to hand the data to Excel rather than
+# write a file we can name. There is nothing scriptable past this point.
+_EXCEL_ROUTE_MARKERS = ("XXL", "MHTML", "SAVE THE DATA IN THE SPREADSHEET")
+
+# Format options of the "Save list in file" dialog, best first. Tab-delimited
+# parses most cleanly; the fixed-width "unconverted" form also works.
+_LOCAL_FILE_FORMATS = ("tab", "spreadsheet", "unconverted", "text")
 
 # Save-list dialog. btn[11] is "Generate"; btn[0] is the fallback on older kernels.
 _SAVE_DIALOG_PATH = "wnd[1]/usr/ctxtDY_PATH"
@@ -78,40 +107,13 @@ class SapIw29Source(ReportSource):
     def extract(self, staging_dir: Path, progress: ProgressFn) -> Extract:
         cfg = self.config
         staging_dir.mkdir(parents=True, exist_ok=True)
-        gui = SapGui(
-            system=cfg.sap.system,
-            client=cfg.sap.client,
-            user=cfg.sap.user,
-            password=self._password,
-            language=cfg.sap.language,
-            logon_path=cfg.sap.logon_path,
-            attach_timeout_s=cfg.sap.attach_timeout_s,
-            step_timeout_s=cfg.sap.step_timeout_s,
-            close_connection=cfg.sap.close_connection,
-            reuse_existing_connection=cfg.sap.reuse_existing_connection,
-        )
+        gui = SapGui.from_config(cfg, self._password)
 
         progress(f"Connecting to SAP system {cfg.sap.system}...")
         with gui.session() as session:
-            progress(f"Opening transaction {cfg.selection.transaction}.")
-            session.start_transaction(cfg.selection.transaction)
-            session.dismiss_popups()
-
-            self._apply_variant(session, progress)
-            self._apply_layout(session)
-            self._apply_filters(session, progress)
-            self._apply_checkboxes(session)
-            self._apply_raw_steps(session)
-
-            progress("Executing the report...")
-            started = time.monotonic()
-            session.send_vkey(VKEY_EXECUTE)
-            session.raise_on_error()
-            session.dismiss_popups()
-            log.info("Report finished in %.1fs", time.monotonic() - started)
-
-            grid = self._find_grid(session)
-            self._guard_empty_result(session, grid)
+            self.open_transaction(session, progress)
+            self.apply_selection(session, progress)
+            grid = self.execute(session, progress)
 
             reported_rows = _grid_row_count(grid)
             if reported_rows is not None:
@@ -131,6 +133,33 @@ class SapIw29Source(ReportSource):
                 path=target, kind=kind, reported_by_sap=reported_rows
             )
 
+    # ---------------------------------------------------------------- steps
+
+    def open_transaction(self, session: SapSession, progress: ProgressFn) -> None:
+        progress(f"Opening transaction {self.config.selection.transaction}.")
+        session.start_transaction(self.config.selection.transaction)
+        session.dismiss_popups()
+
+    def apply_selection(self, session: SapSession, progress: ProgressFn) -> None:
+        self._apply_variant(session, progress)
+        self._apply_layout(session)
+        self._apply_filters(session, progress)
+        self._apply_checkboxes(session)
+        self._apply_raw_steps(session)
+
+    def execute(self, session: SapSession, progress: ProgressFn) -> Optional[Any]:
+        """Run the report and return the ALV grid control, if there is one."""
+        progress("Executing the report...")
+        started = time.monotonic()
+        session.send_vkey(VKEY_EXECUTE)
+        session.raise_on_error()
+        session.dismiss_popups()
+        log.info("Report finished in %.1fs", time.monotonic() - started)
+
+        grid = self._find_grid(session)
+        self._guard_empty_result(session, grid)
+        return grid
+
     # ---------------------------------------------------------------- selection
 
     def _apply_variant(self, session: SapSession, progress: ProgressFn) -> None:
@@ -138,33 +167,74 @@ class SapIw29Source(ReportSource):
         if not variant:
             return
         progress(f"Loading selection variant '{variant}'.")
-        if not session.exists(_GET_VARIANT_BUTTON):
+
+        if not self._open_variant_dialog(session):
             raise SapError(
-                "The 'Get Variant' toolbar button is not on this screen, so "
-                f"selection.variant='{variant}' cannot be applied."
+                f"Could not open the 'Get Variant' dialog, so selection.variant="
+                f"'{variant}' cannot be applied. Tried the toolbar button, Shift+F5 "
+                "and Goto > Variants > Get..."
             )
-        session.press(_GET_VARIANT_BUTTON)
-        for element_id in ("wnd[1]/usr/txtV-LOW", "wnd[1]/usr/txtENAME-LOW"):
-            if session.exists(element_id):
-                session.set_text(
-                    element_id, variant if element_id.endswith("V-LOW") else ""
-                )
+
+        if session.exists(_VARIANT_NAME_FIELD):
+            session.set_text(_VARIANT_NAME_FIELD, variant)
+        else:
+            raise SapError(
+                f"The variant dialog has no name field at {_VARIANT_NAME_FIELD} on "
+                "this release. Run 'iw29-export inspect' with the dialog open to find "
+                "the right id."
+            )
+        # Blank the "created by" filter, otherwise only your own variants match.
+        if session.exists(_VARIANT_OWNER_FIELD):
+            session.set_text(_VARIANT_OWNER_FIELD, "")
+
         session.send_vkey(VKEY_EXECUTE, "wnd[1]")
 
-        # A single hit loads straight away; several hits leave a pick list open.
-        if session.exists("wnd[1]"):
-            row = session.optional(
-                "wnd[1]/usr/lbl[1,2]"
-            ) or session.optional("wnd[1]/usr/tblSAPLALDBSINGLE")
-            if row is not None:
-                try:
-                    row.setFocus()
-                    session.send_vkey(VKEY_ENTER, "wnd[1]")
-                except Exception:
-                    session.dismiss_popups()
-            else:
-                session.dismiss_popups()
+        # One match loads straight away; several leave a pick list open.
+        if session.wait_for_window("wnd[1]", timeout_s=2):
+            self._choose_from_variant_list(session, variant)
+
         session.raise_on_error()
+        log.info("Variant '%s' loaded.", variant)
+
+    def _open_variant_dialog(self, session: SapSession) -> bool:
+        attempts = (
+            (_GET_VARIANT_BUTTON, "toolbar button", session.press),
+            (None, "Shift+F5", None),
+            (_GET_VARIANT_MENU, "Goto > Variants > Get...", session.select),
+        )
+        for element_id, label, action in attempts:
+            if element_id is None:
+                session.send_vkey(VKEY_GET_VARIANT)
+            elif session.exists(element_id) and action is not None:
+                action(element_id)
+            else:
+                continue
+            if session.wait_for_window("wnd[1]", timeout_s=6):
+                log.info("Variant dialog opened via the %s.", label)
+                return True
+            log.info("The %s did not open a dialog; trying the next route.", label)
+        return False
+
+    def _choose_from_variant_list(self, session: SapSession, variant: str) -> None:
+        grid = None
+        for element_id in _GRID_CANDIDATES:
+            grid = session.optional(element_id.replace("wnd[0]", "wnd[1]"))
+            if grid is not None:
+                break
+        if grid is not None:
+            try:
+                grid.currentCellRow = 0
+                grid.doubleClickCurrentCell()
+                session.wait_ready()
+                return
+            except Exception:
+                log.info("Could not double-click the variant list; pressing Choose.")
+        session.send_vkey(VKEY_CHOOSE, "wnd[1]")
+        if session.exists("wnd[1]"):
+            raise SapError(
+                f"A dialog stayed open after selecting variant '{variant}': "
+                f"{session.popup_text() or '<no text>'}. Check the variant name."
+            )
 
     def _apply_layout(self, session: SapSession) -> None:
         layout = self.config.selection.layout
@@ -323,14 +393,7 @@ class SapIw29Source(ReportSource):
         progress: ProgressFn,
     ) -> None:
         progress("Exporting the result list as tab-delimited text.")
-        if grid is not None:
-            _grid_context_export(grid, "&PC")
-            session.wait_ready()
-        else:
-            session.set_text("wnd[0]/tbar[0]/okcd", "%PC")
-            session.send_vkey(VKEY_ENTER)
-
-        self._choose_format_if_asked(session, prefer=("spreadsheet", "tab"))
+        self._open_export_dialog(session, grid, "&PC")
         self._fill_save_dialog(session, target)
 
     def _export_native_xlsx(
@@ -340,48 +403,111 @@ class SapIw29Source(ReportSource):
         target: Path,
         progress: ProgressFn,
     ) -> None:
-        if grid is None:
-            raise ExportError(
-                "export.mode='native_xlsx' needs an ALV grid, but this output is a "
-                "classic list. Use export.mode='text_then_convert'."
-            )
         progress("Exporting through SAP's own spreadsheet dialog.")
-        _grid_context_export(grid, "&XXL")
-        session.wait_ready()
-        self._choose_format_if_asked(session, prefer=("xlsx", "excel"))
+        self._open_export_dialog(session, grid, "&XXL")
         self._fill_save_dialog(session, target)
 
-    def _choose_format_if_asked(
-        self, session: SapSession, prefer: Sequence[str]
+    def _open_export_dialog(
+        self, session: SapSession, grid: Optional[Any], context_item: str
     ) -> None:
-        """Pick a radio button by its label instead of guessing an index."""
-        if not session.exists("wnd[1]") or session.exists(_SAVE_DIALOG_PATH):
-            return
-        options = _radio_buttons(session)
-        if not options:
+        """Reach SAP's local-file save dialog, backing out of dead ends.
+
+        Several buttons look like "export" but lead to the XXL/Excel route, which
+        hands the file to Excel and offers nothing a script can fill in. So each
+        route is followed only as far as needed to tell whether it produces the
+        DY_PATH dialog; if it does not, the popups are cancelled and the next
+        route is tried.
+        """
+        tried: List[str] = []
+        for label, attempt in self._export_routes(session, grid, context_item):
+            tried.append(label)
+            try:
+                attempt()
+            except Exception as exc:
+                log.info("Export via %s was not available: %s", label, _brief(exc))
+                continue
+            if not session.wait_for_window("wnd[1]", timeout_s=10):
+                log.info("%s opened no dialog; trying the next route.", label)
+                continue
+            if self._reach_save_dialog(session):
+                log.info("Save dialog reached via %s.", label)
+                return
+            log.info("%s leads to the Excel route, not a local file; backing out.", label)
+            _cancel_popups(session)
+
+        raise ExportError(
+            "None of these export routes reached SAP's local-file save dialog: "
+            + "; ".join(tried)
+            + ". Run 'iw29-export inspect --execute' to dump the result screen, then "
+            "set the working id under [[selection.raw]]."
+        )
+
+    def _reach_save_dialog(self, session: SapSession, hops: int = 4) -> bool:
+        """Walk through format dialogs until DY_PATH appears, or give up."""
+        for _ in range(hops):
+            if session.exists(_SAVE_DIALOG_PATH):
+                return True
+            text = session.popup_text()
+            if any(marker in text.upper() for marker in _EXCEL_ROUTE_MARKERS):
+                return False
+            options = _radio_buttons(session)
+            if not options:
+                return False
+            chosen = _prefer_option(options, _LOCAL_FILE_FORMATS)
+            log.info("Format dialog: choosing %r", chosen[1])
+            session.set_checked(chosen[0], True)
             session.send_vkey(VKEY_ENTER, "wnd[1]")
-            return
-        chosen = None
-        for keyword in prefer:
-            for element_id, label in options:
-                if keyword in label.lower():
-                    chosen = (element_id, label)
-                    break
-            if chosen:
-                break
-        if chosen is None:
-            chosen = options[0]
-        log.info("Export format dialog: choosing '%s'", chosen[1])
-        session.set_checked(chosen[0], True)
-        session.send_vkey(VKEY_ENTER, "wnd[1]")
+            session.wait_for_window("wnd[1]", timeout_s=5)
+        return session.exists(_SAVE_DIALOG_PATH)
+
+    def _export_routes(
+        self, session: SapSession, grid: Optional[Any], context_item: str
+    ) -> List[tuple]:
+        """Ordered best-first. For text output the local-file routes come first."""
+        grid_routes: List[tuple] = []
+        if grid is not None:
+            grid_routes = [
+                (
+                    f"the ALV grid context item {context_item}",
+                    lambda: _grid_select_context(grid, context_item),
+                ),
+                (
+                    f"the ALV export menu then {context_item}",
+                    lambda: _grid_context_export(grid, context_item),
+                ),
+            ]
+
+        menu_routes: List[tuple] = []
+        for labels in _EXPORT_MENU_PATHS:
+            menu_id = session.menu_id(labels)
+            if menu_id:
+                menu_routes.append(
+                    (f"the menu {' > '.join(labels)}", _menu_action(session, menu_id))
+                )
+
+        toolbar_routes: List[tuple] = []
+        for element_id, tooltip in _toolbar_buttons(session):
+            if any(word in tooltip.lower() for word in _EXPORT_TOOLTIP_WORDS):
+                toolbar_routes.append(
+                    (
+                        f"the toolbar button {element_id} ({tooltip.strip()!r})",
+                        _press_action(session, element_id),
+                    )
+                )
+
+        ok_code_routes = [("the %PC command", _ok_code_action(session, "%PC"))]
+
+        if context_item == "&XXL":
+            return grid_routes + toolbar_routes + menu_routes + ok_code_routes
+        return grid_routes + ok_code_routes + menu_routes + toolbar_routes
 
     def _fill_save_dialog(self, session: SapSession, target: Path) -> None:
-        if not session.exists(_SAVE_DIALOG_PATH):
+        if not session.wait_for_element(_SAVE_DIALOG_PATH, timeout_s=10):
             session.dismiss_popups()
-        if not session.exists(_SAVE_DIALOG_PATH):
+        if not session.wait_for_element(_SAVE_DIALOG_PATH, timeout_s=10):
             raise ExportError(
-                "SAP never opened its save dialog. Record the export once with "
-                "Alt+F12 and paste the ids into the config."
+                "SAP never opened its save dialog. Run 'iw29-export inspect' after "
+                "executing the report to see what the export button actually opens."
             )
 
         session.set_text(_SAVE_DIALOG_PATH, str(target.parent) + "\\")
@@ -400,6 +526,44 @@ class SapIw29Source(ReportSource):
         session.raise_on_error()
 
 
+def _menu_action(session: SapSession, element_id: str):
+    return lambda: session.select(element_id)
+
+
+def _press_action(session: SapSession, element_id: str):
+    return lambda: session.press(element_id)
+
+
+def _ok_code_action(session: SapSession, code: str):
+    def run() -> None:
+        session.set_text("wnd[0]/tbar[0]/okcd", code)
+        session.send_vkey(VKEY_ENTER)
+
+    return run
+
+
+def _toolbar_buttons(session: SapSession) -> List[tuple]:
+    """Application-toolbar buttons as (id, tooltip), so they can be matched by name."""
+    found: List[tuple] = []
+    for container_id in ("wnd[0]/tbar[1]", "wnd[0]/tbar[0]"):
+        container = session.optional(container_id)
+        if container is None:
+            continue
+        try:
+            count = int(container.Children.Count)
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                child = container.Children(index)
+                if str(child.Type) != "GuiButton":
+                    continue
+                found.append((relative_id(str(child.Id)), str(child.Tooltip or "")))
+            except Exception:
+                continue
+    return found
+
+
 def _type_multiple_selection(
     session: SapSession, field_name: str, values: List[str]
 ) -> None:
@@ -416,15 +580,41 @@ def _type_multiple_selection(
 
 
 def _grid_context_export(grid: Any, context_item: str) -> None:
-    try:
-        grid.pressToolbarContextButton("&MB_EXPORT")
-        grid.selectContextMenuItem(context_item)
-    except Exception as exc:
-        raise ExportError(
-            "The ALV export button did not respond. This grid may not offer "
-            f"'{context_item}'; record the export with Alt+F12 to see what your "
-            "system uses."
-        ) from exc
+    grid.pressToolbarContextButton("&MB_EXPORT")
+    grid.selectContextMenuItem(context_item)
+
+
+def _grid_select_context(grid: Any, context_item: str) -> None:
+    """Fire a grid context function directly, without opening its export menu."""
+    grid.selectContextMenuItem(context_item)
+
+
+def _prefer_option(options: List[tuple], keywords: Sequence[str]) -> tuple:
+    for keyword in keywords:
+        for element_id, label in options:
+            if keyword in label.lower():
+                return element_id, label
+    return options[0]
+
+
+def _cancel_popups(session: SapSession, limit: int = 5) -> None:
+    for _ in range(limit):
+        if not session.exists("wnd[1]"):
+            return
+        try:
+            session.send_vkey(VKEY_F12_CANCEL, "wnd[1]")
+        except Exception:
+            break
+    if session.exists("wnd[1]"):
+        log.warning(
+            "Could not close a SAP dialog while backing out: %s",
+            session.popup_text() or "<no text>",
+        )
+
+
+def _brief(exc: Exception) -> str:
+    text = str(exc).replace("\n", " ")
+    return text if len(text) <= 160 else text[:157] + "..."
 
 
 def _grid_row_count(grid: Optional[Any]) -> Optional[int]:
@@ -470,19 +660,11 @@ def _collect_radio_buttons(node: Any, found: List[tuple], depth: int) -> None:
             continue
         if kind == "GuiRadioButton":
             try:
-                found.append((_relative_id(str(child.Id)), str(child.Text or "")))
+                found.append((relative_id(str(child.Id)), str(child.Text or "")))
             except Exception:
                 continue
         else:
             _collect_radio_buttons(child, found, depth + 1)
-
-
-def _relative_id(element_id: str) -> str:
-    marker = "/ses[0]/"
-    if marker in element_id:
-        return element_id.split(marker, 1)[1]
-    index = element_id.find("wnd[")
-    return element_id[index:] if index >= 0 else element_id
 
 
 def _staging_filename(config: Config) -> str:

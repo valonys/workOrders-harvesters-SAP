@@ -142,6 +142,40 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(table.headers, ["Notification", "Work Ctr"])
         self.assertEqual(table.rows, [[10200001, "MECH01"]])
 
+    def test_iw29_download_shape(self):
+        """What IW29 'Text with Tabs' actually produces: a page title, blank
+        lines, then a header and rows that all start with a tab."""
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "list.txt"
+            path.write_text(
+                "30.07.2026          Dynamic List Display                    1\n"
+                "\n"
+                "\n"
+                "\tP\tTyp\tCreated On\tMessage\n"
+                "\n"
+                "\t3\tNC\t07.10.2010\t13073653\n"
+                "\t2\tNC\t27.01.2011\t13076382\n",
+                encoding="utf-8",
+            )
+            table = convert.read_sap_text(path)
+        self.assertEqual(table.headers, ["P", "Typ", "Created On", "Message"])
+        self.assertEqual(table.row_count, 2)
+        self.assertEqual(table.rows[0], [3, "NC", date(2010, 10, 7), 13073653])
+
+    def test_repeated_page_header_is_dropped(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "list.txt"
+            path.write_text(
+                "Notification\tWork Ctr\n"
+                "10200001\tMECH01\n"
+                "Notification\tWork Ctr\n"
+                "10200002\tMECH02\n",
+                encoding="utf-8",
+            )
+            table = convert.read_sap_text(path)
+        self.assertEqual(table.row_count, 2)
+        self.assertEqual(table.rows[1], [10200002, "MECH02"])
+
     def test_duplicate_headers_are_disambiguated(self):
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / "list.txt"

@@ -25,9 +25,11 @@ STATUS_BAR = "wnd[0]/sbar"
 OK_CODE = "wnd[0]/tbar[0]/okcd"
 
 VKEY_ENTER = 0
+VKEY_CHOOSE = 2
 VKEY_F3_BACK = 3
 VKEY_EXECUTE = 8
 VKEY_F12_CANCEL = 12
+VKEY_GET_VARIANT = 17
 
 # Popup titles/buttons we can safely answer without a human. Anything else is
 # surfaced as an error rather than guessed at.
@@ -158,6 +160,50 @@ class SapSession:
             f"SAP was still busy after {timeout_s or self.step_timeout_s}s."
         )
 
+    def wait_for_window(self, window: str = "wnd[1]", timeout_s: float = 8.0) -> bool:
+        """Wait for a modal window to appear.
+
+        `Busy` can read False in the gap between a press returning and SAP
+        actually putting the dialog up, so checking `exists` once right after an
+        action is a race. Everything that opens a popup goes through here.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.wait_ready()
+            if self.exists(window):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.15)
+
+    def wait_for_element(self, element_id: str, timeout_s: float = 8.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.wait_ready()
+            if self.exists(element_id):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.15)
+
+    def menu_id(self, labels: Sequence[str]) -> Optional[str]:
+        """Resolve a menu path by its visible labels, e.g. System > List > Save.
+
+        Menu indexes shift between releases and even between screens of the same
+        transaction, so nothing here is allowed to hardcode menu[3]/menu[5].
+        """
+        node: Optional[Any] = self.optional("wnd[0]/mbar")
+        if node is None:
+            return None
+        for label in labels:
+            node = _child_menu(node, label)
+            if node is None:
+                return None
+        try:
+            return relative_id(str(node.Id))
+        except Exception:
+            return None
+
     def status(self) -> StatusMessage:
         bar = self.optional(STATUS_BAR)
         if bar is None:
@@ -239,9 +285,27 @@ class SapSession:
 class SapGui:
     """Attaches to (or starts) SAP Logon and hands out a ready session."""
 
+    @classmethod
+    def from_config(cls, config: Any, password: str = "") -> "SapGui":
+        sap = config.sap
+        return cls(
+            system=sap.system,
+            connection_name=sap.connection_name,
+            client=sap.client,
+            user=sap.user,
+            password=password,
+            language=sap.language,
+            logon_path=sap.logon_path,
+            attach_timeout_s=sap.attach_timeout_s,
+            step_timeout_s=sap.step_timeout_s,
+            close_connection=sap.close_connection,
+            reuse_existing_connection=sap.reuse_existing_connection,
+        )
+
     def __init__(
         self,
         system: str,
+        connection_name: str = "",
         client: str = "",
         user: str = "",
         password: str = "",
@@ -253,6 +317,7 @@ class SapGui:
         reuse_existing_connection: bool = True,
     ):
         self.system = system
+        self.connection_name = connection_name
         self.client = client
         self.user = user
         self._password = password
@@ -379,14 +444,17 @@ class SapGui:
                 self._owns_connection = False
                 return existing
 
-        log.info("Opening a new SAP connection to %s.", self.system)
+        target = self.connection_name or self.system
+        log.info("Opening a new SAP connection using '%s'.", target)
         try:
-            connection = self._application.OpenConnection(self.system, True)
+            connection = self._application.OpenConnection(target, True)
         except Exception as exc:
-            raise SapError(
-                f"Could not open a connection to '{self.system}'. The name must match "
-                "an entry in SAP Logon exactly (or be a valid connection string)."
-            ) from exc
+            hint = (
+                "sap.connection_name must match the SAP Logon entry exactly. Note "
+                "that this is the description shown in SAP Logon, not the three "
+                f"letter system id: '{self.system}' on its own will not work."
+            )
+            raise SapError(f"Could not open a connection using '{target}'. {hint}") from exc
         self._owns_connection = True
         return connection
 
@@ -442,6 +510,31 @@ class SapGui:
             sap_session.set_checked("wnd[1]/usr/radMULTI_LOGON_OPT2", True)
             sap_session.send_vkey(VKEY_ENTER, "wnd[1]")
         sap_session.dismiss_popups()
+
+
+def relative_id(element_id: str) -> str:
+    """Strip the connection/session prefix so an id can be reused with findById."""
+    marker = "/ses[0]/"
+    if marker in element_id:
+        return element_id.split(marker, 1)[1]
+    index = element_id.find("wnd[")
+    return element_id[index:] if index >= 0 else element_id
+
+
+def _child_menu(node: Any, label: str) -> Optional[Any]:
+    wanted = _normalise_label(label)
+    for child in _com_children(node):
+        try:
+            text = _normalise_label(str(child.Text or ""))
+        except Exception:
+            continue
+        if text == wanted:
+            return child
+    return None
+
+
+def _normalise_label(text: str) -> str:
+    return text.replace("&", "").replace(".", "").replace(" ", "").strip().lower()
 
 
 def _com_children(parent: Any) -> Sequence[Any]:

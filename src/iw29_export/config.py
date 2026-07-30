@@ -33,6 +33,9 @@ VALID_RAW_ACTIONS = ("set_text", "set_checked", "press", "send_vkey", "select")
 @dataclass
 class SapConfig:
     system: str = ""
+    # The SAP Logon entry name, which is usually not the system id. Needed only
+    # to open a fresh connection; matching an already-open one uses `system`.
+    connection_name: str = ""
     client: str = ""
     user: str = ""
     language: str = "EN"
@@ -283,6 +286,7 @@ def _section(data: Dict[str, Any], name: str, path: Path) -> Dict[str, Any]:
 def _build_sap(raw: Dict[str, Any]) -> SapConfig:
     return SapConfig(
         system=_str(raw, "sap.system", ""),
+        connection_name=_str(raw, "sap.connection_name", ""),
         client=_str(raw, "sap.client", ""),
         user=_str(raw, "sap.user", ""),
         language=_str(raw, "sap.language", "EN"),
