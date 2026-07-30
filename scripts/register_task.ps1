@@ -9,14 +9,16 @@
     export will fail. That is why this registers an interactive task instead.
 
 .EXAMPLE
-    .\register_task.ps1 -Time 06:00
-    .\register_task.ps1 -Time 06:00 -Arguments "run --days 1" -Unregister:$false
+    .\register_task.ps1 -Time 12:30 -Weekdays
+    .\register_task.ps1 -Time 06:00 -Arguments "run --days 1"
+    .\register_task.ps1 -Unregister
 #>
 [CmdletBinding()]
 param(
     [string]$TaskName = "SAP IW29 Export",
     [string]$Time = "06:00",
     [string]$Arguments = "run",
+    [switch]$Weekdays,
     [switch]$Unregister
 )
 
@@ -36,7 +38,14 @@ if ($Unregister) {
 }
 
 $action = New-ScheduledTaskAction -Execute $runner -Argument $Arguments -WorkingDirectory $root
-$trigger = New-ScheduledTaskTrigger -Daily -At $Time
+if ($Weekdays) {
+    $trigger = New-ScheduledTaskTrigger -Weekly -At $Time `
+        -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday
+    $when = "every weekday at $Time"
+} else {
+    $trigger = New-ScheduledTaskTrigger -Daily -At $Time
+    $when = "daily at $Time"
+}
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -48,5 +57,5 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 
-Write-Host "Registered '$TaskName' to run $runner $Arguments daily at $Time."
+Write-Host "Registered '$TaskName' to run $runner $Arguments $when."
 Write-Host "It only runs while $env:USERNAME is logged on, which SAP GUI Scripting requires."
