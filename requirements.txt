@@ -1,0 +1,6 @@
+# Everything the default configuration needs. The workbook writer uses only the
+# standard library, so there is no Excel or openpyxl dependency.
+pywin32>=306 ; sys_platform == "win32"
+tomli>=2.0.1 ; python_version < "3.11"
+
+# Optional features live in requirements-optional.txt.

@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Only needed for sap.auth = "credential_manager".
+keyring>=24.3.0
+
+# Only needed for export.mode = "native_xlsx", which reads back a workbook SAP
+# wrote itself. The default mode does not need this.
+openpyxl>=3.1.2

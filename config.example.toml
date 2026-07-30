@@ -1,0 +1,97 @@
+# Copy to config.toml and edit. Nothing in here is a secret: passwords live in
+# Windows Credential Manager, never in this file.
+
+[sap]
+system = "FR3"
+client = ""                  # blank = whatever the SAP Logon entry defaults to
+user = ""                    # blank = single sign-on
+language = "EN"
+auth = "sso"                 # sso | credential_manager | prompt
+credential_service = "sap-iw29-export"
+logon_path = 'C:\Program Files (x86)\SAP\FrontEnd\SAPgui\saplogon.exe'
+# How long to wait for saplogon.exe to publish its scripting engine.
+attach_timeout_s = 90
+# How long any single SAP round trip may take before we give up.
+step_timeout_s = 300
+# Close the connection we opened when we are done. Never closes a connection
+# that was already open when the app started.
+close_connection = true
+reuse_existing_connection = true
+
+[selection]
+transaction = "IW29"
+# A saved selection-screen variant is by far the most robust option: SAP holds
+# the criteria, so field IDs cannot drift underneath the script. If set, the
+# filters/ranges/checkboxes below are applied on top of the variant.
+variant = ""
+layout = ""                  # ALV layout, e.g. "/DAILY"
+lookback_days = 30           # used when date_from/date_to are blank
+date_from = ""               # "2026-07-01" or blank
+date_to = ""                 # "2026-07-30" or blank
+
+# Single-value or list selections. `field` is the ABAP select-option name from
+# the selection screen; run the recorder once (Alt+F12) to confirm names.
+[[selection.filters]]
+field = "SWERK"              # maintenance plant
+values = ["1000"]
+
+[[selection.filters]]
+field = "ARBPL"              # main work centre
+values = ["MECH01", "ELEC02"]
+
+# Ranges map to the LOW/HIGH pair of a select-option. {date_from}/{date_to}
+# are substituted from the dates resolved above.
+[[selection.ranges]]
+field = "QMDAT"              # notification date
+low = "{date_from}"
+high = "{date_to}"
+
+# Status checkboxes on the IW29 selection screen.
+[selection.checkboxes]
+DY_OFN = true                # outstanding
+DY_IAR = true                # in process
+DY_MAB = false               # completed
+
+# Escape hatch: verbatim IDs pasted from a recorded script, applied last.
+# action = set_text | set_checked | press | send_vkey | select
+# [[selection.raw]]
+# id = 'wnd[0]/usr/ctxtQMART-LOW'
+# action = "set_text"
+# value = "M2"
+
+[export]
+# Point this at the OneDrive-synced SharePoint library folder.
+folder = 'C:\Users\J1125651\OneDrive - Company\IW29'
+filename_pattern = "IW29_{system}_{timestamp:%Y%m%d}.xlsx"
+# text_then_convert: SAP writes tab-delimited text, we build a real .xlsx from
+#   it. Reliable, no Excel install needed, correct types. Recommended.
+# native_xlsx: drive SAP's own spreadsheet dialog. Only if you must keep SAP
+#   formatting.
+mode = "text_then_convert"
+sheet_name = "IW29"
+encoding = "utf-8-sig"
+# Scratch space. Files are only moved into `folder` once complete, so OneDrive
+# never uploads a half-written report. Blank = %LOCALAPPDATA%.
+staging_folder = ""
+overwrite = true
+
+[archive]
+enabled = true
+archive_after_days = 7
+delete_after_days = 365
+folder = ""                  # blank = <export.folder>\archive
+
+[dataset]
+# A single flat file that Power BI can point at, instead of a folder of dated
+# workbooks.
+enabled = true
+folder = ""                  # blank = <export.folder>\dataset
+filename = "iw29_dataset.csv"
+mode = "replace"             # replace | append
+add_run_columns = true       # run_timestamp + source_file columns
+
+[runtime]
+mock = false                 # true = generate sample data, never touch SAP
+log_folder = ""              # blank = <project>\logs
+log_level = "INFO"
+lock_timeout_s = 0           # >0 waits for a concurrent run, 0 fails fast

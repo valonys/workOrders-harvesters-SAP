@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sap-iw29-export"
+version = "1.0.0"
+description = "Lightweight app that exports SAP IW29 notifications to a SharePoint-synced folder"
+requires-python = ">=3.9"
+dependencies = [
+    "pywin32>=306 ; sys_platform == 'win32'",
+    "tomli>=2.0.1 ; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+credentials = ["keyring>=24.3.0"]
+native-xlsx = ["openpyxl>=3.1.2"]
+
+[project.scripts]
+iw29-export = "iw29_export.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
