@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import archive as archive_module
-from . import convert, credentials, dataset, files, lock
+from . import convert, credentials, dataset, files, lock, master_sync
 from .config import Config
 from .errors import Iw29Error
 from .logging_setup import get_logger
@@ -30,6 +30,8 @@ class RunResult:
     row_count: int = 0
     column_count: int = 0
     dataset_file: Optional[Path] = None
+    master_synced: Optional[Path] = None
+    master_rows: int = 0
     archived: int = 0
     deleted: int = 0
     warnings: List[str] = field(default_factory=list)
@@ -101,6 +103,16 @@ def run(
         if config.dataset.enabled:
             emit("Refreshing the Power BI dataset...")
             result.dataset_file = dataset.build(config, table, published, timestamp)
+
+        if config.master_dashboard.enabled:
+            emit("Syncing Open_NINC on the master dashboard...")
+            synced = master_sync.sync(config, published)
+            result.master_synced = synced.master
+            result.master_rows = synced.rows_copied
+            emit(
+                f"Master dashboard updated: {synced.rows_copied:,} rows -> "
+                f"{synced.master.name}!{config.master_dashboard.dest_sheet}"
+            )
 
         if config.archive.enabled and not skip_archive:
             emit("Archiving older reports...")

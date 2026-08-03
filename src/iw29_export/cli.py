@@ -20,6 +20,7 @@ COMMANDS = (
     "run",
     "check",
     "inspect",
+    "sync-master",
     "archive",
     "gui",
     "store-password",
@@ -31,6 +32,7 @@ commands:
   run                 export the report (default when no command is given)
   check               verify SAP, folders and credentials without running anything
   inspect             open the transaction and dump the real screen element ids
+  sync-master         copy the latest harvest A2:N into the master Open_NINC sheet
   archive             only file away old reports
   gui                 open the desktop app
   store-password      save the SAP password in Windows Credential Manager
@@ -40,6 +42,7 @@ examples:
   iw29-export --mock                     try the whole flow with generated data
   iw29-export check                      pre-flight the setup
   iw29-export run --days 7               last 7 days into the synced folder
+  iw29-export sync-master                refresh Open_NINC from the latest harvest
   iw29-export archive --dry-run          show what housekeeping would do
 """
 
@@ -72,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-archive", action="store_true", help="skip the archive pass")
     parser.add_argument("--no-dataset", action="store_true", help="skip the Power BI dataset")
     parser.add_argument(
+        "--no-master",
+        action="store_true",
+        help="skip syncing the master dashboard Open_NINC sheet",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="archive command only: change nothing"
     )
     parser.add_argument(
@@ -101,6 +109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "run": _command_run,
         "check": _command_check,
         "inspect": _command_inspect,
+        "sync-master": _command_sync_master,
         "archive": _command_archive,
         "gui": _command_gui,
         "store-password": _command_store_password,
@@ -147,6 +156,8 @@ def _load_config(args: argparse.Namespace) -> Config:
         overrides["export.folder"] = Path(args.out).expanduser()
     if getattr(args, "no_dataset", False):
         overrides["dataset.enabled"] = False
+    if getattr(args, "no_master", False):
+        overrides["master_dashboard.enabled"] = False
     if getattr(args, "no_archive", False):
         overrides["archive.enabled"] = False
     if getattr(args, "log_level", None):
@@ -197,6 +208,21 @@ def _command_inspect(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_sync_master(config: Config, args: argparse.Namespace) -> int:
+    from . import master_sync
+
+    del args
+    if not config.master_dashboard.enabled:
+        # Allow an explicit sync-master even if the daily run flag is off.
+        config = config.with_overrides(**{"master_dashboard.enabled": True})
+    result = master_sync.sync(config)
+    print(
+        f"Copied {result.rows_copied:,} rows from {result.source.name} "
+        f"into {result.master.name}!{config.master_dashboard.dest_sheet}"
+    )
+    return 0
+
+
 def _command_archive(config: Config, args: argparse.Namespace) -> int:
     result = archive.run(config, dry_run=args.dry_run)
     print(("Dry run: " if args.dry_run else "") + result.summary)
@@ -243,6 +269,10 @@ def _print_summary(result: pipeline.RunResult, quiet: bool) -> None:
     ]
     if result.dataset_file:
         lines.append(f"Dataset       : {result.dataset_file}")
+    if result.master_synced:
+        lines.append(
+            f"Master        : {result.master_synced} ({result.master_rows:,} rows)"
+        )
     if result.archived or result.deleted:
         lines.append(f"Housekeeping  : {result.archived} archived, {result.deleted} deleted")
     lines.append(f"Duration      : {result.duration_s:.1f}s")

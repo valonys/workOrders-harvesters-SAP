@@ -140,10 +140,28 @@ class SapSession:
 
     def start_transaction(self, code: str) -> None:
         """``/n`` prefix ends whatever is running, so this is safe mid-session."""
-        self.set_text(OK_CODE, f"/n{code.strip().upper()}")
+        wanted = code.strip().upper()
+        self.set_text(OK_CODE, f"/n{wanted}")
         self.send_vkey(VKEY_ENTER)
         self.raise_on_error()
-        log.debug("Transaction after start: %s", self.transaction or "<unknown>")
+
+        # Confirm it landed. Without this a swallowed ok-code leaves the run on
+        # whatever screen was already open, where the same element ids mean
+        # different things and the failure surfaces much later as nonsense.
+        actual = (self.transaction or "").strip().upper()
+        if actual != wanted:
+            raise SapError(
+                f"Asked SAP for transaction {wanted} but it is showing "
+                f"{actual or '<none>'} ({self.window_title() or 'no title'}). "
+                "Something on screen refused the command."
+            )
+        log.debug("Transaction after start: %s", actual)
+
+    def window_title(self) -> str:
+        try:
+            return str(self.find(WND0).text or "").strip()
+        except Exception:
+            return ""
 
     def maximise(self) -> None:
         try:
@@ -308,6 +326,7 @@ class SapGui:
             step_timeout_s=sap.step_timeout_s,
             close_connection=sap.close_connection,
             reuse_existing_connection=sap.reuse_existing_connection,
+            own_session=sap.own_session,
         )
 
     def __init__(
@@ -323,7 +342,9 @@ class SapGui:
         step_timeout_s: int = 300,
         close_connection: bool = True,
         reuse_existing_connection: bool = True,
+        own_session: bool = True,
     ):
+        self.own_session = own_session
         self.system = system
         self.connection_name = connection_name
         self.client = client
@@ -340,6 +361,7 @@ class SapGui:
         self._connection: Any = None
         self._owns_connection = False
         self._launched_logon = False
+        self._created_session_id = ""
 
     @contextmanager
     def session(self) -> Iterator[SapSession]:
@@ -360,7 +382,7 @@ class SapGui:
                 f"{self.system}."
             )
 
-        com_session = self._connection.Children(0)
+        com_session = self._pick_session()
         sap_session = SapSession(com_session, self.step_timeout_s)
         sap_session.wait_ready(self.attach_timeout_s)
 
@@ -374,7 +396,59 @@ class SapGui:
         )
         return sap_session
 
+    def _pick_session(self) -> Any:
+        """Work in our own SAP session rather than the one the user is using.
+
+        Session 0 is whatever the person at the keyboard has on screen. Driving it
+        means the run and the user type over each other, and the run inherits
+        whatever screen was left open - which is how a scheduled run once pressed
+        "Get Variant" on a result list, where the same button id means
+        "Change <-> Display".
+        """
+        first = self._connection.Children(0)
+        if self._owns_connection or not self.own_session:
+            return first
+
+        before = _child_count(self._connection)
+        try:
+            first.createSession()
+        except Exception as exc:
+            log.warning(
+                "Could not open a separate SAP session (%s); using the one already "
+                "on screen. Avoid touching SAP while this runs.",
+                exc,
+            )
+            return first
+
+        created = self._wait_for_new_session(before)
+        if created is None:
+            log.warning(
+                "SAP did not open a new session (the six-session limit may be "
+                "reached); using the one already on screen."
+            )
+            return first
+
+        self._created_session_id = str(created.Id)
+        log.info("Working in a separate SAP session, leaving yours untouched.")
+        return created
+
+    def _wait_for_new_session(self, before: int, timeout_s: float = 30.0) -> Any:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if _child_count(self._connection) > before:
+                return self._connection.Children(_child_count(self._connection) - 1)
+            time.sleep(0.25)
+        return None
+
     def disconnect(self) -> None:
+        if self._created_session_id and not self._owns_connection:
+            try:
+                self._connection.closeSession(self._created_session_id)
+                log.info("Closed the SAP session this run opened.")
+            except Exception as exc:
+                log.warning("Could not close the session this run opened: %s", exc)
+            self._created_session_id = ""
+
         if self._connection is not None and self.close_connection and self._owns_connection:
             try:
                 self._connection.closeConnection()
@@ -543,6 +617,13 @@ def _child_menu(node: Any, label: str) -> Optional[Any]:
 
 def _normalise_label(text: str) -> str:
     return text.replace("&", "").replace(".", "").replace(" ", "").strip().lower()
+
+
+def _child_count(parent: Any) -> int:
+    try:
+        return int(parent.Children.Count)
+    except Exception:
+        return 0
 
 
 def _com_children(parent: Any) -> Sequence[Any]:

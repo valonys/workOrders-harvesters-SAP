@@ -136,9 +136,25 @@ class SapIw29Source(ReportSource):
     # ---------------------------------------------------------------- steps
 
     def open_transaction(self, session: SapSession, progress: ProgressFn) -> None:
-        progress(f"Opening transaction {self.config.selection.transaction}.")
-        session.start_transaction(self.config.selection.transaction)
+        transaction = self.config.selection.transaction
+        progress(f"Opening transaction {transaction}.")
+        session.start_transaction(transaction)
         session.dismiss_popups()
+
+        # The transaction code alone does not prove which of its screens we are
+        # on: IW29's result list reports IW29 too, and there several button ids
+        # mean something entirely different from the selection screen.
+        if not self._on_selection_screen(session):
+            title = session.window_title() or "an unknown screen"
+            raise SapError(
+                f"{transaction} opened on '{title}' rather than its selection "
+                "screen, so the selection cannot be entered safely."
+            )
+
+    def _on_selection_screen(self, session: SapSession) -> bool:
+        window = self.config.selection.notification_date
+        markers = (window.field_low, window.field_high, "QMNUM-LOW")
+        return any(self._plain_field(session, name) for name in markers)
 
     def apply_selection(self, session: SapSession, progress: ProgressFn) -> None:
         self._apply_variant(session, progress)
@@ -206,11 +222,18 @@ class SapIw29Source(ReportSource):
             (_GET_VARIANT_MENU, "Goto > Variants > Get...", session.select),
         )
         for element_id, label, action in attempts:
-            if element_id is None:
-                session.send_vkey(VKEY_GET_VARIANT)
-            elif session.exists(element_id) and action is not None:
-                action(element_id)
-            else:
+            # A route that raises must not kill the run; that is the whole point
+            # of having alternatives. A disabled key or menu item just means
+            # "not on this screen".
+            try:
+                if element_id is None:
+                    session.send_vkey(VKEY_GET_VARIANT)
+                elif session.exists(element_id) and action is not None:
+                    action(element_id)
+                else:
+                    continue
+            except Exception as exc:
+                log.info("The %s is not usable here: %s", label, _brief(exc))
                 continue
             if session.wait_for_window("wnd[1]", timeout_s=6):
                 log.info("Variant dialog opened via the %s.", label)

@@ -50,6 +50,9 @@ class SapConfig:
     step_timeout_s: int = 300
     close_connection: bool = True
     reuse_existing_connection: bool = True
+    # Open a separate SAP session instead of driving the one on screen, so a
+    # scheduled run and the person at the keyboard never fight over it.
+    own_session: bool = True
 
 
 @dataclass
@@ -168,6 +171,18 @@ class DatasetConfig:
 
 
 @dataclass
+class MasterDashboardConfig:
+    """After harvest, paste IW29!A2:N into the master workbook's Open_NINC sheet."""
+
+    enabled: bool = False
+    path: Optional[Path] = None
+    source_sheet: str = "IW29"
+    dest_sheet: str = "Open_NINC"
+    # Last helper-formula column on Open_NINC (AL = 38 on the current workbook).
+    formula_last_col: int = 38
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -182,6 +197,9 @@ class Config:
     export: ExportConfig = field(default_factory=ExportConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    master_dashboard: MasterDashboardConfig = field(
+        default_factory=MasterDashboardConfig
+    )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
 
@@ -221,6 +239,9 @@ class Config:
             export=_build_export(_section(data, "export", path)),
             archive=_build_archive(_section(data, "archive", path)),
             dataset=_build_dataset(_section(data, "dataset", path)),
+            master_dashboard=_build_master_dashboard(
+                _section(data, "master_dashboard", path)
+            ),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
         )
@@ -264,6 +285,16 @@ class Config:
                 f"dataset.mode must be one of {VALID_DATASET_MODES}, "
                 f"got '{self.dataset.mode}'."
             )
+        if self.master_dashboard.enabled:
+            if not self.master_dashboard.path:
+                raise ConfigError(
+                    "master_dashboard.path must be set when master_dashboard.enabled "
+                    "is true."
+                )
+            if self.master_dashboard.formula_last_col < 14:
+                raise ConfigError(
+                    "master_dashboard.formula_last_col must be >= 14 (column N)."
+                )
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
         if not str(self.export.folder).strip():
@@ -326,6 +357,7 @@ def _build_sap(raw: Dict[str, Any]) -> SapConfig:
         step_timeout_s=_int(raw, "sap.step_timeout_s", 300),
         close_connection=_bool(raw, "sap.close_connection", True),
         reuse_existing_connection=_bool(raw, "sap.reuse_existing_connection", True),
+        own_session=_bool(raw, "sap.own_session", True),
     )
 
 
@@ -452,6 +484,17 @@ def _build_dataset(raw: Dict[str, Any]) -> DatasetConfig:
         filename=_sanitise_filename(_str(raw, "dataset.filename", "iw29_dataset.csv")),
         mode=_str(raw, "dataset.mode", "replace").strip().lower(),
         add_run_columns=_bool(raw, "dataset.add_run_columns", True),
+    )
+
+
+def _build_master_dashboard(raw: Dict[str, Any]) -> MasterDashboardConfig:
+    path_text = _str(raw, "master_dashboard.path", "").strip()
+    return MasterDashboardConfig(
+        enabled=_bool(raw, "master_dashboard.enabled", False),
+        path=Path(path_text).expanduser() if path_text else None,
+        source_sheet=_str(raw, "master_dashboard.source_sheet", "IW29").strip(),
+        dest_sheet=_str(raw, "master_dashboard.dest_sheet", "Open_NINC").strip(),
+        formula_last_col=_int(raw, "master_dashboard.formula_last_col", 38),
     )
 
 

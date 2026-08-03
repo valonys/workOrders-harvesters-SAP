@@ -17,6 +17,7 @@ step_timeout_s = 300
 # that was already open when the app started.
 close_connection = true
 reuse_existing_connection = true
+own_session = true
 
 [selection]
 transaction = "IW29"
@@ -108,6 +109,15 @@ folder = ""                  # blank = <export.folder>\dataset
 filename = "iw29_dataset.csv"
 mode = "replace"             # replace | append
 add_run_columns = true       # run_timestamp + source_file columns
+
+# Paste the harvested IW29!A2:N block into the master dashboard after each run.
+# Helper formula columns (O onwards) are preserved and filled down.
+[master_dashboard]
+enabled = false
+path = ""                    # e.g. C:\Users\...\IW29\Notifs_Master_Dashboard.xlsx
+source_sheet = "IW29"
+dest_sheet = "Open_NINC"
+formula_last_col = 38
 
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP

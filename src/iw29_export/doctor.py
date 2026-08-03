@@ -52,6 +52,7 @@ def run(config: Config) -> List[Check]:
     checks.append(_writable(config.log_folder, "Log folder"))
     checks.append(_selection(config))
     checks.append(_notification_dates(config))
+    checks.append(_master_dashboard(config))
     return checks
 
 
@@ -224,4 +225,19 @@ def _notification_dates(config: Config) -> Check:
         "Notification dates",
         OK,
         f"open-ended ({window.describe()}), so new notifications are always captured",
+    )
+
+
+def _master_dashboard(config: Config) -> Check:
+    master = config.master_dashboard
+    if not master.enabled:
+        return Check("Master dashboard", OK, "disabled")
+    if master.path is None:
+        return Check("Master dashboard", FAIL, "enabled but path is empty")
+    if not master.path.exists():
+        return Check("Master dashboard", FAIL, f"not found: {master.path}")
+    return Check(
+        "Master dashboard",
+        OK,
+        f"{master.path.name}!{master.dest_sheet} <- harvest!{master.source_sheet} A2:N",
     )
