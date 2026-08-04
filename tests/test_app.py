@@ -139,6 +139,32 @@ class CoerceTests(unittest.TestCase):
         self.assertEqual(convert.coerce("  Pump fault "), "Pump fault")
 
 
+class NotifListTests(unittest.TestCase):
+    def test_txt_list_skips_comments_and_dedupes(self):
+        from iw29_export.notif_list import load_notification_numbers
+
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "list.txt"
+            path.write_text(
+                "# header\n13073653\n13073654\n13073653\n",
+                encoding="utf-8",
+            )
+            numbers = load_notification_numbers(path)
+        self.assertEqual(numbers, ["13073653", "13073654"])
+
+    def test_csv_list_uses_notification_column(self):
+        from iw29_export.notif_list import load_notification_numbers
+
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "list.csv"
+            path.write_text(
+                "Notification,Note\n13073653,alpha\n13073654,beta\n",
+                encoding="utf-8",
+            )
+            numbers = load_notification_numbers(path)
+        self.assertEqual(numbers, ["13073653", "13073654"])
+
+
 class ParseTests(unittest.TestCase):
     def test_tab_delimited(self):
         with tempfile.TemporaryDirectory() as scratch:

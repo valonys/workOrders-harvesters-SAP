@@ -53,6 +53,7 @@ def run(config: Config) -> List[Check]:
     checks.append(_selection(config))
     checks.append(_notification_dates(config))
     checks.append(_master_dashboard(config))
+    checks.append(_iw22_attachments(config))
     return checks
 
 
@@ -240,4 +241,34 @@ def _master_dashboard(config: Config) -> Check:
         "Master dashboard",
         OK,
         f"{master.path.name}!{master.dest_sheet} <- harvest!{master.source_sheet} A2:N",
+    )
+
+
+def _iw22_attachments(config: Config) -> Check:
+    cfg = config.iw22_attachments
+    if not cfg.enabled:
+        return Check("IW22 attachments", OK, "disabled")
+    if cfg.list_path is None:
+        return Check("IW22 attachments", FAIL, "enabled but list_path is empty")
+    if not cfg.list_path.exists():
+        return Check(
+            "IW22 attachments",
+            WARN,
+            f"list file missing (create it before the run): {cfg.list_path}",
+        )
+    try:
+        text = cfg.list_path.read_text(encoding="utf-8-sig")
+        numbers = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    except OSError as exc:
+        return Check("IW22 attachments", FAIL, f"cannot read list: {exc}")
+    mode = cfg.attachment_mode
+    extra = f", match '{cfg.match_text}'" if mode == "match" else ""
+    return Check(
+        "IW22 attachments",
+        OK if numbers else WARN,
+        f"{len(numbers)} number(s) in {cfg.list_path.name}, mode={mode}{extra}",
     )

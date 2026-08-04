@@ -119,6 +119,20 @@ source_sheet = "IW29"
 dest_sheet = "Open_NINC"
 formula_last_col = 38
 
+# Open each notification in IW22, open GOS attachments, save one file per number.
+# List file: .txt (one number per line), .csv or .xlsx.
+[iw22_attachments]
+enabled = false
+list_path = ""               # e.g. C:\Users\...\IW29\iw22_notification_list.txt
+list_column = "Notification"
+list_sheet = ""
+attachment_mode = "first"    # first | match
+match_text = "REPORT"
+output_folder = ""           # blank = <export.folder>\iw22_attachments
+download_watch_folder = ""   # blank = user Downloads
+download_timeout_s = 45
+limit = 0
+
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP
 log_folder = ""              # blank = <project>\logs

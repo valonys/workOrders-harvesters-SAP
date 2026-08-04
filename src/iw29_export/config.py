@@ -183,6 +183,23 @@ class MasterDashboardConfig:
 
 
 @dataclass
+class Iw22AttachmentsConfig:
+    """Harvest GOS attachments from IW22 for each number in a list file."""
+
+    enabled: bool = False
+    list_path: Optional[Path] = None
+    list_column: str = "Notification"
+    list_sheet: str = ""
+    # first = row 0; match = BITM_DESCR contains match_text
+    attachment_mode: str = "first"
+    match_text: str = "REPORT"
+    output_folder: Optional[Path] = None
+    download_watch_folder: Optional[Path] = None
+    download_timeout_s: int = 45
+    limit: int = 0  # 0 = all
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -199,6 +216,9 @@ class Config:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     master_dashboard: MasterDashboardConfig = field(
         default_factory=MasterDashboardConfig
+    )
+    iw22_attachments: Iw22AttachmentsConfig = field(
+        default_factory=Iw22AttachmentsConfig
     )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
@@ -241,6 +261,9 @@ class Config:
             dataset=_build_dataset(_section(data, "dataset", path)),
             master_dashboard=_build_master_dashboard(
                 _section(data, "master_dashboard", path)
+            ),
+            iw22_attachments=_build_iw22_attachments(
+                _section(data, "iw22_attachments", path)
             ),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
@@ -295,6 +318,17 @@ class Config:
                 raise ConfigError(
                     "master_dashboard.formula_last_col must be >= 14 (column N)."
                 )
+        if self.iw22_attachments.enabled:
+            if not self.iw22_attachments.list_path:
+                raise ConfigError(
+                    "iw22_attachments.list_path must be set when enabled is true."
+                )
+            mode = self.iw22_attachments.attachment_mode.strip().lower()
+            if mode not in {"first", "match"}:
+                raise ConfigError(
+                    "iw22_attachments.attachment_mode must be 'first' or 'match'."
+                )
+            self.iw22_attachments.attachment_mode = mode
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
         if not str(self.export.folder).strip():
@@ -495,6 +529,26 @@ def _build_master_dashboard(raw: Dict[str, Any]) -> MasterDashboardConfig:
         source_sheet=_str(raw, "master_dashboard.source_sheet", "IW29").strip(),
         dest_sheet=_str(raw, "master_dashboard.dest_sheet", "Open_NINC").strip(),
         formula_last_col=_int(raw, "master_dashboard.formula_last_col", 38),
+    )
+
+
+def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
+    list_path = _str(raw, "iw22_attachments.list_path", "").strip()
+    output = _str(raw, "iw22_attachments.output_folder", "").strip()
+    watch = _str(raw, "iw22_attachments.download_watch_folder", "").strip()
+    return Iw22AttachmentsConfig(
+        enabled=_bool(raw, "iw22_attachments.enabled", False),
+        list_path=Path(list_path).expanduser() if list_path else None,
+        list_column=_str(raw, "iw22_attachments.list_column", "Notification").strip(),
+        list_sheet=_str(raw, "iw22_attachments.list_sheet", "").strip(),
+        attachment_mode=_str(
+            raw, "iw22_attachments.attachment_mode", "first"
+        ).strip().lower(),
+        match_text=_str(raw, "iw22_attachments.match_text", "REPORT").strip(),
+        output_folder=Path(output).expanduser() if output else None,
+        download_watch_folder=Path(watch).expanduser() if watch else None,
+        download_timeout_s=_int(raw, "iw22_attachments.download_timeout_s", 45),
+        limit=_int(raw, "iw22_attachments.limit", 0),
     )
 
 

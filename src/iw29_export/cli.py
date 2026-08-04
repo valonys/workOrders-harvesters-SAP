@@ -21,6 +21,7 @@ COMMANDS = (
     "check",
     "inspect",
     "sync-master",
+    "iw22-attachments",
     "archive",
     "gui",
     "store-password",
@@ -33,6 +34,7 @@ commands:
   check               verify SAP, folders and credentials without running anything
   inspect             open the transaction and dump the real screen element ids
   sync-master         copy the latest harvest A2:N into the master Open_NINC sheet
+  iw22-attachments    open each notification in IW22 and harvest its GOS attachment
   archive             only file away old reports
   gui                 open the desktop app
   store-password      save the SAP password in Windows Credential Manager
@@ -43,6 +45,7 @@ examples:
   iw29-export check                      pre-flight the setup
   iw29-export run --days 7               last 7 days into the synced folder
   iw29-export sync-master                refresh Open_NINC from the latest harvest
+  iw29-export iw22-attachments           harvest attachments for the configured list
   iw29-export archive --dry-run          show what housekeeping would do
 """
 
@@ -110,6 +113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "check": _command_check,
         "inspect": _command_inspect,
         "sync-master": _command_sync_master,
+        "iw22-attachments": _command_iw22_attachments,
         "archive": _command_archive,
         "gui": _command_gui,
         "store-password": _command_store_password,
@@ -221,6 +225,24 @@ def _command_sync_master(config: Config, args: argparse.Namespace) -> int:
         f"into {result.master.name}!{config.master_dashboard.dest_sheet}"
     )
     return 0
+
+
+def _command_iw22_attachments(config: Config, args: argparse.Namespace) -> int:
+    from . import iw22_attachments
+
+    del args
+    if not config.iw22_attachments.enabled:
+        config = config.with_overrides(**{"iw22_attachments.enabled": True})
+    result = iw22_attachments.run(config)
+    print(
+        f"IW22 attachments: {result.saved} saved, {result.skipped} skipped, "
+        f"{result.failed} failed"
+    )
+    for item in result.results:
+        where = f" -> {item.path.name}" if item.path else ""
+        detail = f" ({item.detail})" if item.detail else ""
+        print(f"  [{item.status}] {item.notification}{where}{detail}")
+    return 1 if result.failed and result.saved == 0 else 0
 
 
 def _command_archive(config: Config, args: argparse.Namespace) -> int:

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Registers the daily IW29 export as a Windows scheduled task.
+    Registers a SAP harvest job as a Windows scheduled task.
 
 .DESCRIPTION
     SAP GUI Scripting drives a real, visible SAP GUI, so the task must run in
@@ -10,8 +10,9 @@
 
 .EXAMPLE
     .\register_task.ps1 -Time 12:30 -Weekdays
-    .\register_task.ps1 -Time 06:00 -Arguments "run --days 1"
-    .\register_task.ps1 -Unregister
+    .\register_task.ps1 -Time 08:00 -Days Wednesday -TaskName "SAP IW22 Attachments" -Arguments "iw22-attachments"
+    .\register_task.ps1 -Time 14:00 -Days Monday,Friday -TaskName "SAP IW22 Attachments" -Arguments "iw22-attachments"
+    .\register_task.ps1 -Unregister -TaskName "SAP IW22 Attachments"
 #>
 [CmdletBinding()]
 param(
@@ -19,6 +20,8 @@ param(
     [string]$Time = "06:00",
     [string]$Arguments = "run",
     [switch]$Weekdays,
+    [ValidateSet("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")]
+    [string[]]$Days = @(),
     [switch]$Unregister
 )
 
@@ -38,7 +41,10 @@ if ($Unregister) {
 }
 
 $action = New-ScheduledTaskAction -Execute $runner -Argument $Arguments -WorkingDirectory $root
-if ($Weekdays) {
+if ($Days.Count -gt 0) {
+    $trigger = New-ScheduledTaskTrigger -Weekly -At $Time -DaysOfWeek $Days
+    $when = "every $($Days -join ', ') at $Time"
+} elseif ($Weekdays) {
     $trigger = New-ScheduledTaskTrigger -Weekly -At $Time `
         -DaysOfWeek Monday, Tuesday, Wednesday, Thursday, Friday
     $when = "every weekday at $Time"
@@ -51,7 +57,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
