@@ -190,8 +190,8 @@ class Iw22AttachmentsConfig:
     list_path: Optional[Path] = None
     list_column: str = "Notification"
     list_sheet: str = ""
-    # first = row 0; match = BITM_DESCR contains match_text
-    attachment_mode: str = "first"
+    # first = row 0; match = BITM_DESCR contains match_text; all = every row
+    attachment_mode: str = "all"
     match_text: str = "REPORT"
     output_folder: Optional[Path] = None
     download_watch_folder: Optional[Path] = None
@@ -246,8 +246,10 @@ class Config:
     def load(cls, path: Optional[Path] = None) -> "Config":
         path = _resolve_config_path(path)
         try:
-            with path.open("rb") as handle:
-                data = tomllib.load(handle)
+            # Strip a UTF-8 BOM if an editor (or PowerShell Set-Content) added one;
+            # tomllib rejects it as "Invalid statement" at line 1.
+            raw_bytes = path.read_bytes().lstrip(b"\xef\xbb\xbf")
+            data = tomllib.loads(raw_bytes.decode("utf-8"))
         except OSError as exc:
             raise ConfigError(f"Cannot read config file {path}: {exc}") from exc
         except Exception as exc:  # tomllib raises TOMLDecodeError
@@ -324,9 +326,10 @@ class Config:
                     "iw22_attachments.list_path must be set when enabled is true."
                 )
             mode = self.iw22_attachments.attachment_mode.strip().lower()
-            if mode not in {"first", "match"}:
+            if mode not in {"first", "match", "all"}:
                 raise ConfigError(
-                    "iw22_attachments.attachment_mode must be 'first' or 'match'."
+                    "iw22_attachments.attachment_mode must be "
+                    "'first', 'match' or 'all'."
                 )
             self.iw22_attachments.attachment_mode = mode
         if not self.selection.transaction.strip():
@@ -542,7 +545,7 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
         list_column=_str(raw, "iw22_attachments.list_column", "Notification").strip(),
         list_sheet=_str(raw, "iw22_attachments.list_sheet", "").strip(),
         attachment_mode=_str(
-            raw, "iw22_attachments.attachment_mode", "first"
+            raw, "iw22_attachments.attachment_mode", "all"
         ).strip().lower(),
         match_text=_str(raw, "iw22_attachments.match_text", "REPORT").strip(),
         output_folder=Path(output).expanduser() if output else None,

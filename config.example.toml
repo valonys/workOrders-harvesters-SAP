@@ -126,12 +126,12 @@ enabled = false
 list_path = ""               # e.g. C:\Users\...\IW29\iw22_notification_list.txt
 list_column = "Notification"
 list_sheet = ""
-attachment_mode = "first"    # first | match
+attachment_mode = "all"      # first | match | all
 match_text = "REPORT"
 output_folder = ""           # blank = <export.folder>\iw22_attachments
 download_watch_folder = ""   # blank = user Downloads
 download_timeout_s = 45
-limit = 0
+limit = 0                    # 0 = whole list; files named <notif>(1).ext …
 
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP

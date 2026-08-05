@@ -38,6 +38,22 @@ _POPUP_CONFIRM_BUTTONS = (
     "wnd[1]/usr/btnSPOP-OPTION1",
     "wnd[1]/usr/btnBUTTON_1",
 )
+_POPUP_DECLINE_BUTTONS = (
+    "wnd[1]/usr/btnSPOP-OPTION2",  # typically "No"
+    "wnd[1]/tbar[0]/btn[12]",
+    "wnd[1]/usr/btnBUTTON_2",
+)
+_DESTRUCTIVE_POPUP_MARKERS = (
+    "log off",
+    "logoff",
+    "unsaved data will be lost",
+    "do you want to log off",
+)
+
+
+def _is_destructive_popup(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _DESTRUCTIVE_POPUP_MARKERS)
 
 
 @dataclass
@@ -283,6 +299,9 @@ class SapSession:
         if not self.exists("wnd[1]"):
             return False
         text = self.popup_text()
+        if _is_destructive_popup(text):
+            log.info("Declining destructive SAP popup: %s", text or "<no text>")
+            return self.decline_popup()
         for button in _POPUP_CONFIRM_BUTTONS:
             if self.exists(button):
                 log.info("Confirming SAP popup: %s", text or "<no text>")
@@ -292,20 +311,48 @@ class SapSession:
         self.send_vkey(VKEY_ENTER, "wnd[1]")
         return True
 
+    def decline_popup(self) -> bool:
+        """Answer a modal dialog with No / Cancel when one is open."""
+        if not self.exists("wnd[1]"):
+            return False
+        for button in _POPUP_DECLINE_BUTTONS:
+            if self.exists(button):
+                self.press(button)
+                return True
+        self.send_vkey(VKEY_F12_CANCEL, "wnd[1]")
+        return True
+
     def dismiss_popups(self, limit: int = 5) -> List[str]:
         seen: List[str] = []
         for _ in range(limit):
             if not self.exists("wnd[1]"):
                 break
+            # The GOS attachment list is also wnd[1]. Never "confirm" it away.
+            if self._looks_like_attachment_list():
+                log.info(
+                    "Leaving attachment list open: %s",
+                    self.popup_text() or "<attachment list>",
+                )
+                break
             seen.append(self.popup_text())
             if not self.confirm_popup():
                 break
-        if self.exists("wnd[1]"):
+        if self.exists("wnd[1]") and not self._looks_like_attachment_list():
             raise SapError(
                 "A SAP dialog stayed open and could not be answered automatically: "
                 f"{self.popup_text() or '<no text>'}"
             )
         return seen
+
+    def _looks_like_attachment_list(self) -> bool:
+        for element_id in (
+            "wnd[1]/usr/cntlCONTAINER_0100/shellcont/shell",
+            "wnd[1]/usr/cntlCONTAINER/shellcont/shell",
+        ):
+            if self.exists(element_id):
+                return True
+        text = (self.popup_text() or "").lower()
+        return "attachment list" in text and self.exists("wnd[1]/usr")
 
 
 class SapGui:

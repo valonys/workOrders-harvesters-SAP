@@ -239,7 +239,8 @@ def _command_iw22_attachments(config: Config, args: argparse.Namespace) -> int:
         f"{result.failed} failed"
     )
     for item in result.results:
-        where = f" -> {item.path.name}" if item.path else ""
+        paths = item.paths or ([item.path] if item.path else [])
+        where = f" -> {', '.join(p.name for p in paths)}" if paths else ""
         detail = f" ({item.detail})" if item.detail else ""
         print(f"  [{item.status}] {item.notification}{where}{detail}")
     return 1 if result.failed and result.saved == 0 else 0

@@ -9,6 +9,7 @@ are user-specific. It opens IW22 directly and feeds each number from the list.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ class AttachmentResult:
     notification: str
     status: str  # saved | skipped | failed
     path: Optional[Path] = None
+    paths: List[Path] = field(default_factory=list)
     detail: str = ""
 
 
@@ -118,7 +120,7 @@ def run(config: Config, progress: Optional[ProgressFn] = None) -> HarvestResult:
         f"Done: {summary.saved} saved, {summary.skipped} skipped, "
         f"{summary.failed} failed in {(finished - started).total_seconds():.1f}s"
     )
-    if summary.saved == 0 and summary.failed == 0:
+    if summary.saved == 0 and summary.failed == 0 and summary.skipped == 0:
         raise EmptyResultError("No attachments were saved (all skipped or empty).")
     return summary
 
@@ -148,45 +150,93 @@ def _harvest_one(
             detail="attachment list grid not found",
         )
 
-    row = _pick_row(grid, cfg.attachment_mode, cfg.match_text)
-    if row is None:
+    rows = _pick_rows(grid, cfg.attachment_mode, cfg.match_text)
+    if not rows:
         return AttachmentResult(
             notification=number,
             status="skipped",
             detail=f"no attachment matched mode={cfg.attachment_mode!r}",
         )
 
-    description = _cell_text(grid, row, "BITM_DESCR") or f"row{row}"
-    before = _snapshot_files(watch_dir)
+    saved_paths: List[Path] = []
+    already: List[Path] = []
+    errors: List[str] = []
+    watch_dirs = _watch_dirs(watch_dir)
 
-    if not _export_or_open(session, grid, row):
+    for seq, row in enumerate(rows, start=1):
+        existing = _existing_destination(out_dir, number, seq)
+        if existing is not None:
+            already.append(existing)
+            log.info("Already have %s — skipping index %s.", existing.name, seq)
+            continue
+
+        grid = _ensure_attachment_grid(session, grid)
+        if grid is None:
+            errors.append(f"index {seq}: attachment list unavailable")
+            break
+
+        # Row indexes are stable for the current open list; after a reopen the
+        # same absolute row still corresponds to the same attachment order.
+        description = _cell_text(grid, row, "BITM_DESCR") or f"row{row}"
+        before = {folder: _snapshot_files(folder) for folder in watch_dirs}
+        before[out_dir] = _snapshot_files(out_dir)
+
+        if not _export_or_open(
+            session, grid, row, out_dir, number, seq, description
+        ):
+            errors.append(f"row {row}: could not export/open")
+            grid = None  # force reopen on next index
+            continue
+
+        saved = _wait_for_new_file_any(before, timeout_s=cfg.download_timeout_s)
+        if saved is None:
+            errors.append(
+                f"row {row}: no new file under "
+                + ", ".join(str(p) for p in [*watch_dirs, out_dir])
+            )
+            grid = None
+            continue
+
+        target = _destination(out_dir, number, seq, saved)
+        if saved.resolve() != target.resolve():
+            if target.exists():
+                try:
+                    saved.unlink()
+                except OSError:
+                    pass
+                already.append(target)
+                grid = None
+                continue
+            shutil.move(str(saved), str(target))
+        saved_paths.append(target)
+        log.info("Saved %s → %s (%s)", number, target.name, description)
+        grid = None  # list often closes after export; reopen for the next file
+
+
+    all_paths = already + saved_paths
+    if saved_paths:
+        names = ", ".join(path.name for path in saved_paths)
         return AttachmentResult(
             notification=number,
-            status="failed",
-            detail="could not export/open the attachment",
+            status="saved",
+            path=saved_paths[0],
+            paths=all_paths,
+            detail=names,
         )
-
-    saved = _wait_for_new_file(watch_dir, before, timeout_s=cfg.download_timeout_s)
-    if saved is None:
-        # Some systems open the document in-place without writing to Downloads.
+    if already and not errors:
+        names = ", ".join(path.name for path in already)
         return AttachmentResult(
             notification=number,
-            status="failed",
-            detail=(
-                "attachment opened but no new file appeared in "
-                f"{watch_dir}. Set iw22_attachments.download_watch_folder or "
-                "export the attachment manually once to see where SAP writes it."
-            ),
+            status="skipped",
+            path=already[0],
+            paths=already,
+            detail=f"already harvested: {names}",
         )
-
-    target = _destination(out_dir, number, description, saved)
-    shutil.move(str(saved), str(target))
-    log.info("Saved %s → %s", number, target.name)
     return AttachmentResult(
         notification=number,
-        status="saved",
-        path=target,
-        detail=description,
+        status="failed",
+        paths=all_paths,
+        detail="; ".join(errors) or "no attachments saved",
     )
 
 
@@ -243,24 +293,48 @@ def _attachment_grid(session: SapSession) -> Optional[Any]:
     return None
 
 
-def _pick_row(grid: Any, mode: str, match_text: str) -> Optional[int]:
+def _ensure_attachment_grid(session: SapSession, grid: Optional[Any]) -> Optional[Any]:
+    """Return a live attachment grid, reopening GOS if the list was closed."""
+    if grid is not None:
+        try:
+            _ = _row_count(grid)
+            return grid
+        except Exception:
+            pass
+    _close_attachment_dialogs(session)
+    if not _open_attachment_list(session):
+        return None
+    return _attachment_grid(session)
+
+
+def _pick_rows(grid: Any, mode: str, match_text: str) -> List[int]:
     count = _row_count(grid)
     if count <= 0:
-        return None
-    mode = (mode or "first").strip().lower()
+        return []
+    mode = (mode or "all").strip().lower()
+    if mode == "all":
+        return list(range(count))
     if mode == "first":
-        return 0
+        return [0]
     needle = (match_text or "").strip().lower()
     if not needle:
-        return 0
+        return [0]
     for row in range(count):
         text = _cell_text(grid, row, "BITM_DESCR").lower()
         if needle in text:
-            return row
-    return None
+            return [row]
+    return []
 
 
-def _export_or_open(session: SapSession, grid: Any, row: int) -> bool:
+def _export_or_open(
+    session: SapSession,
+    grid: Any,
+    row: int,
+    out_dir: Path,
+    number: str,
+    seq: int,
+    description: str,
+) -> bool:
     """Prefer an export/save action; fall back to the recorded double-click."""
     try:
         grid.currentCellColumn = "BITM_DESCR"
@@ -269,46 +343,63 @@ def _export_or_open(session: SapSession, grid: Any, row: int) -> bool:
     except Exception:
         pass
 
-    for attempt in (
-        lambda: grid.pressToolbarContextButton("&MB_EXPORT"),
-        lambda: grid.selectContextMenuItem("&EXPORT"),
-        lambda: grid.selectContextMenuItem("EXPORT"),
-        lambda: grid.pressToolbarButton("&EXPORT"),
+    for label, attempt in (
+        ("toolbar export menu", lambda: grid.pressToolbarContextButton("&MB_EXPORT")),
+        ("context &EXPORT", lambda: grid.selectContextMenuItem("&EXPORT")),
+        ("context EXPORT", lambda: grid.selectContextMenuItem("EXPORT")),
+        ("toolbar &EXPORT", lambda: grid.pressToolbarButton("&EXPORT")),
+        ("toolbar %ATTA_EXPORT", lambda: grid.pressToolbarButton("%ATTA_EXPORT")),
     ):
         try:
             attempt()
             session.wait_ready()
-            if _try_save_dialog(session):
+            if _try_save_dialog(session, out_dir, number, seq, description):
+                log.info("Exported via %s.", label)
                 return True
-        except Exception:
-            continue
+        except Exception as exc:
+            log.info("Export via %s not available: %s", label, exc)
 
     # Recorded behaviour: open the attachment (viewer / temp file).
     try:
         grid.doubleClickCurrentCell()
         session.wait_ready()
-        session.dismiss_popups()
-        _try_save_dialog(session)
+        # Do not dismiss popups here — wnd[1] may still be the attachment list.
+        _try_save_dialog(session, out_dir, number, seq, description)
         return True
     except Exception as exc:
         log.info("doubleClickCurrentCell failed: %s", exc)
         return False
 
 
-def _try_save_dialog(session: SapSession) -> bool:
-    """If SAP put up a local-file save dialog, confirm it."""
-    for path_id in (
-        "wnd[1]/usr/ctxtDY_PATH",
-        "wnd[2]/usr/ctxtDY_PATH",
-        "wnd[1]/usr/txtDY_PATH",
-    ):
-        if session.exists(path_id):
-            try:
-                session.send_vkey(VKEY_ENTER, path_id.split("/")[0])
-                session.wait_ready()
-                return True
-            except Exception:
-                return False
+def _try_save_dialog(
+    session: SapSession,
+    out_dir: Path,
+    number: str,
+    seq: int,
+    description: str,
+) -> bool:
+    """If SAP put up a local-file save dialog, point it at our output folder."""
+    preferred = f"{number}({seq})"
+    for window in ("wnd[1]", "wnd[2]", "wnd[3]"):
+        path_id = f"{window}/usr/ctxtDY_PATH"
+        name_id = f"{window}/usr/ctxtDY_FILENAME"
+        if not session.exists(path_id):
+            path_id = f"{window}/usr/txtDY_PATH"
+            name_id = f"{window}/usr/txtDY_FILENAME"
+        if not session.exists(path_id):
+            continue
+        try:
+            session.set_text(path_id, str(out_dir))
+            if session.exists(name_id):
+                current = session.text(name_id).strip()
+                suffix = Path(current).suffix if current else ""
+                session.set_text(name_id, f"{preferred}{suffix or '.bin'}")
+            session.send_vkey(VKEY_ENTER, window)
+            session.wait_ready()
+            return True
+        except Exception as exc:
+            log.info("Save dialog fill failed: %s", exc)
+            return False
     return False
 
 
@@ -356,26 +447,50 @@ def _snapshot_files(folder: Path) -> dict:
     return found
 
 
-def _wait_for_new_file(
-    folder: Path, before: dict, timeout_s: float = 45.0
+def _watch_dirs(primary: Path) -> List[Path]:
+    candidates = [
+        primary,
+        Path.home() / "Downloads",
+        Path(os.environ.get("TEMP", Path.home() / "AppData" / "Local" / "Temp")),
+        Path(os.environ.get("TMP", Path.home() / "AppData" / "Local" / "Temp")),
+    ]
+    found: List[Path] = []
+    seen = set()
+    for folder in candidates:
+        try:
+            resolved = folder.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not folder.exists():
+            continue
+        seen.add(resolved)
+        found.append(folder)
+    return found
+
+
+def _wait_for_new_file_any(
+    before_by_folder: dict, timeout_s: float = 45.0
 ) -> Optional[Path]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        try:
-            for path in folder.iterdir():
-                if not path.is_file() or path.name.startswith("~$"):
-                    continue
-                previous = before.get(path.name)
-                try:
-                    mtime = path.stat().st_mtime
-                except OSError:
-                    continue
-                if previous is None or mtime > previous + 0.5:
-                    # Wait until size stops growing.
-                    if _file_stable(path):
-                        return path
-        except OSError:
-            pass
+        for folder, before in before_by_folder.items():
+            try:
+                for path in folder.iterdir():
+                    if not path.is_file() or path.name.startswith("~$"):
+                        continue
+                    # Ignore trivial temp noise.
+                    if path.suffix.lower() in {".tmp", ".partial", ".crdownload"}:
+                        continue
+                    previous = before.get(path.name)
+                    try:
+                        mtime = path.stat().st_mtime
+                    except OSError:
+                        continue
+                    if previous is None or mtime > previous + 0.5:
+                        if _file_stable(path):
+                            return path
+            except OSError:
+                continue
         time.sleep(0.4)
     return None
 
@@ -400,18 +515,24 @@ def _file_stable(path: Path, checks: int = 3, pause_s: float = 0.35) -> bool:
     return size > 0
 
 
-def _destination(out_dir: Path, number: str, description: str, source: Path) -> Path:
-    safe_desc = re_slug(description)[:60] or "attachment"
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"{number}_{safe_desc}_{stamp}{source.suffix.lower() or source.suffix}"
-    target = out_dir / name
-    if not target.exists():
-        return target
-    for index in range(2, 50):
-        candidate = out_dir / f"{number}_{safe_desc}_{stamp}_{index}{source.suffix}"
-        if not candidate.exists():
-            return candidate
-    return out_dir / f"{number}_{safe_desc}_{stamp}_{time.time_ns()}{source.suffix}"
+def _destination(out_dir: Path, number: str, seq: int, source: Path) -> Path:
+    """Governed name: <notification>(n).<ext>."""
+    suffix = source.suffix.lower() or source.suffix or ".bin"
+    return out_dir / f"{number}({seq}){suffix}"
+
+
+def _existing_destination(out_dir: Path, number: str, seq: int) -> Optional[Path]:
+    """Return an already-harvested file for this notification index, if any."""
+    prefix = f"{number}({seq})"
+    try:
+        for path in out_dir.iterdir():
+            if not path.is_file():
+                continue
+            if path.stem == prefix or path.name.startswith(prefix + "."):
+                return path
+    except OSError:
+        pass
+    return None
 
 
 def re_slug(text: str) -> str:
