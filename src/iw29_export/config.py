@@ -200,6 +200,34 @@ class Iw22AttachmentsConfig:
 
 
 @dataclass
+class Iw38Config:
+    """Multi-variant IW39 order-list harvest for Power BI (GIR/DAL/PAZ/CLV)."""
+
+    enabled: bool = False
+    # LaunchSAP.txt uses IW39 even though the OneDrive folder is named IW38.
+    transaction: str = "IW39"
+    variants: List[str] = field(
+        default_factory=lambda: [
+            "GIR-PG2026",
+            "DAL-PG2026",
+            "PAZ-PG2026",
+            "CLV-PG2026",
+        ]
+    )
+    layout: str = ""
+    folder: Optional[Path] = None
+    filename_pattern: str = "IW38_{system}_{variant}.xlsx"
+    sheet_name: str = "IW38"
+    mode: str = "text_then_convert"
+    # After each harvest, rebuild Performance / Backlog KPI outputs.
+    build_kpi: bool = True
+    # Matching LaunchSAP.txt: Outstanding (MAB) + Historical (HIS).
+    checkboxes: Dict[str, bool] = field(
+        default_factory=lambda: {"DY_MAB": True, "DY_HIS": True}
+    )
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -220,6 +248,7 @@ class Config:
     iw22_attachments: Iw22AttachmentsConfig = field(
         default_factory=Iw22AttachmentsConfig
     )
+    iw38: Iw38Config = field(default_factory=Iw38Config)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
 
@@ -267,6 +296,7 @@ class Config:
             iw22_attachments=_build_iw22_attachments(
                 _section(data, "iw22_attachments", path)
             ),
+            iw38=_build_iw38(_section(data, "iw38", path)),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
         )
@@ -332,6 +362,16 @@ class Config:
                     "'first', 'match' or 'all'."
                 )
             self.iw22_attachments.attachment_mode = mode
+        if self.iw38.enabled:
+            if not self.iw38.variants:
+                raise ConfigError("iw38.variants must list at least one name.")
+            if not self.iw38.transaction.strip():
+                raise ConfigError("iw38.transaction must be set (usually IW39).")
+            if self.iw38.mode not in VALID_EXPORT_MODES:
+                raise ConfigError(
+                    f"iw38.mode must be one of {VALID_EXPORT_MODES}, "
+                    f"got '{self.iw38.mode}'."
+                )
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
         if not str(self.export.folder).strip():
@@ -532,6 +572,32 @@ def _build_master_dashboard(raw: Dict[str, Any]) -> MasterDashboardConfig:
         source_sheet=_str(raw, "master_dashboard.source_sheet", "IW29").strip(),
         dest_sheet=_str(raw, "master_dashboard.dest_sheet", "Open_NINC").strip(),
         formula_last_col=_int(raw, "master_dashboard.formula_last_col", 38),
+    )
+
+
+def _build_iw38(raw: Dict[str, Any]) -> Iw38Config:
+    folder = _str(raw, "iw38.folder", "").strip()
+    variants = [str(item).strip() for item in _sequence(raw, "variants") if str(item).strip()]
+    checkboxes_raw = raw.get("checkboxes") or {"DY_MAB": True, "DY_HIS": True}
+    if not isinstance(checkboxes_raw, dict):
+        raise ConfigError("iw38.checkboxes must be a table of name = true/false.")
+    checkboxes = {str(key): bool(value) for key, value in checkboxes_raw.items()}
+    return Iw38Config(
+        enabled=_bool(raw, "iw38.enabled", False),
+        transaction=_str(raw, "iw38.transaction", "IW39").strip() or "IW39",
+        variants=variants
+        or ["GIR-PG2026", "DAL-PG2026", "PAZ-PG2026", "CLV-PG2026"],
+        layout=_str(raw, "iw38.layout", "").strip(),
+        folder=Path(folder).expanduser() if folder else None,
+        filename_pattern=_str(
+            raw,
+            "iw38.filename_pattern",
+            "IW38_{system}_{variant}.xlsx",
+        ).strip(),
+        sheet_name=_str(raw, "iw38.sheet_name", "IW38").strip() or "IW38",
+        mode=_str(raw, "iw38.mode", "text_then_convert").strip().lower(),
+        build_kpi=_bool(raw, "iw38.build_kpi", True),
+        checkboxes=checkboxes,
     )
 
 

@@ -22,6 +22,8 @@ COMMANDS = (
     "inspect",
     "sync-master",
     "iw22-attachments",
+    "iw38",
+    "iw38-kpi",
     "archive",
     "gui",
     "store-password",
@@ -35,6 +37,8 @@ commands:
   inspect             open the transaction and dump the real screen element ids
   sync-master         copy the latest harvest A2:N into the master Open_NINC sheet
   iw22-attachments    open each notification in IW22 and harvest its GOS attachment
+  iw38                harvest IW39 order lists for the configured PG2026 variants
+  iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
   archive             only file away old reports
   gui                 open the desktop app
   store-password      save the SAP password in Windows Credential Manager
@@ -46,6 +50,8 @@ examples:
   iw29-export run --days 7               last 7 days into the synced folder
   iw29-export sync-master                refresh Open_NINC from the latest harvest
   iw29-export iw22-attachments           harvest attachments for the configured list
+  iw29-export iw38                       download configured IW38/IW39 variants
+  iw29-export iw38-kpi                   rebuild CLV Performance/Backlog smoke KPIs
   iw29-export archive --dry-run          show what housekeeping would do
 """
 
@@ -114,6 +120,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "inspect": _command_inspect,
         "sync-master": _command_sync_master,
         "iw22-attachments": _command_iw22_attachments,
+        "iw38": _command_iw38,
+        "iw38-kpi": _command_iw38_kpi,
         "archive": _command_archive,
         "gui": _command_gui,
         "store-password": _command_store_password,
@@ -244,6 +252,46 @@ def _command_iw22_attachments(config: Config, args: argparse.Namespace) -> int:
         detail = f" ({item.detail})" if item.detail else ""
         print(f"  [{item.status}] {item.notification}{where}{detail}")
     return 1 if result.failed and result.saved == 0 else 0
+
+
+def _command_iw38(config: Config, args: argparse.Namespace) -> int:
+    from . import iw38
+
+    del args
+    if not config.iw38.enabled:
+        from dataclasses import replace
+
+        config = replace(config, iw38=replace(config.iw38, enabled=True))
+    result = iw38.run(config)
+    print(f"IW38: {result.saved} saved, {result.failed} failed")
+    for item in result.results:
+        where = f" -> {item.workbook.name}" if item.workbook else ""
+        detail = f" ({item.detail})" if item.detail else ""
+        print(f"  [{item.status}] {item.variant}{where}{detail}")
+    return 1 if result.failed and result.saved == 0 else 0
+
+
+def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
+    from . import iw38_kpi
+
+    del args
+    variants = config.iw38.variants or ["CLV-PG2026"]
+    exit_code = 0
+    for variant in variants:
+        try:
+            result = iw38_kpi.build_for_variant(config, variant=variant)
+        except Exception as exc:
+            print(f"[{variant}] KPI failed: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        print(
+            f"[{variant}] performance {result.performance_pct:.1%} "
+            f"({result.completed}/{result.total_orders} complete), "
+            f"backlog {result.backlog}"
+        )
+        print(f"  fact: {result.fact_csv}")
+        print(f"  dashboard: {result.dashboard_xlsx}")
+    return exit_code
 
 
 def _command_archive(config: Config, args: argparse.Namespace) -> int:

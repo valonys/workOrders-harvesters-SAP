@@ -133,6 +133,23 @@ download_watch_folder = ""   # blank = user Downloads
 download_timeout_s = 45
 limit = 0                    # 0 = whole list; files named <notif>(1).ext …
 
+# IW39 order lists for Power BI (folder conventionally named IW38).
+# Mirrors LaunchSAP.txt: Outstanding + Historical, then Get Variant.
+# filename_pattern has no date so each variant overwrites a stable path.
+[iw38]
+enabled = false
+transaction = "IW39"
+variants = ["GIR-PG2026", "DAL-PG2026", "PAZ-PG2026", "CLV-PG2026"]
+layout = ""
+folder = ""                  # e.g. C:\Users\...\OneDrive - TotalEnergies\IW38
+filename_pattern = "IW38_{system}_{variant}.xlsx"
+sheet_name = "IW38"
+mode = "text_then_convert"
+build_kpi = true
+[iw38.checkboxes]
+DY_MAB = true
+DY_HIS = true
+
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP
 log_folder = ""              # blank = <project>\logs
