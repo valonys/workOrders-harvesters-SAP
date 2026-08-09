@@ -248,6 +248,33 @@ def _iw22_attachments(config: Config) -> Check:
     cfg = config.iw22_attachments
     if not cfg.enabled:
         return Check("IW22 attachments", OK, "disabled")
+    if cfg.batches:
+        parts = []
+        worst = OK
+        for batch in cfg.batches:
+            path = batch.list_path
+            if not path.exists():
+                parts.append(f"{batch.name}: list missing")
+                worst = WARN if worst == OK else worst
+                continue
+            try:
+                text = path.read_text(encoding="utf-8-sig")
+                numbers = [
+                    line.strip()
+                    for line in text.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            except OSError as exc:
+                return Check("IW22 attachments", FAIL, f"{batch.name}: {exc}")
+            parts.append(f"{batch.name}={len(numbers)}")
+            if not numbers:
+                worst = WARN
+        return Check(
+            "IW22 attachments",
+            worst,
+            f"{len(cfg.batches)} batch(es) [{', '.join(parts)}], "
+            f"mode={cfg.attachment_mode}, skip={cfg.skip_extensions}",
+        )
     if cfg.list_path is None:
         return Check("IW22 attachments", FAIL, "enabled but list_path is empty")
     if not cfg.list_path.exists():

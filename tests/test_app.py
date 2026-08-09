@@ -138,6 +138,18 @@ class CoerceTests(unittest.TestCase):
     def test_text_is_trimmed(self):
         self.assertEqual(convert.coerce("  Pump fault "), "Pump fault")
 
+    def test_far_future_yyyymmdd_is_not_a_date(self):
+        # SAP order numbers like 73231022 must not become date(7323, 10, 22).
+        self.assertEqual(convert.coerce("73231022"), 73231022)
+
+    def test_order_header_stays_text(self):
+        self.assertEqual(convert.coerce("73231022", header="Order"), "73231022")
+
+    def test_identifier_repairs_mangled_order_date(self):
+        self.assertEqual(convert.identifier_text("7323-10-22"), "73231022")
+        self.assertEqual(convert.identifier_text(date(7323, 10, 22)), "73231022")
+        self.assertEqual(convert.identifier_text(1981006), "73231022")
+
 
 class NotifListTests(unittest.TestCase):
     def test_txt_list_skips_comments_and_dedupes(self):
@@ -293,6 +305,75 @@ class PipelineTests(unittest.TestCase):
 
             leftovers = list((root / "sync").glob("~$*"))
             self.assertEqual(leftovers, [], "temporary files should not be left behind")
+
+
+class ScenarioTests(unittest.TestCase):
+    def test_observation_scenario_is_one_sentence(self):
+        from iw29_export import iw22_scenario
+
+        text = """
+Observation report
+SITE PAZ / EP-PAZ (FPSO Pazflor)
+Description of the observation :
+Handrails loose - risk of falling down level.
+Location :
+P4-S4
+Sub-Location :
+Process Deck S4
+Location Details :
+S4 PD mezzanine
+IMMEDIATE ACTIONS IMPLEMENTED ?
+Call SPV and install hard barrier scaffolding.
+Sent at :
+Nov 27, 2024
+"""
+        sentence = iw22_scenario.summarize_text(text)
+        self.assertTrue(sentence.endswith("."))
+        self.assertIn("P4-S4", sentence)
+        self.assertIn("handrails", sentence.lower())
+        self.assertNotIn("|", sentence)
+
+    def test_inspection_scenario_includes_location_and_findings(self):
+        from iw29_export import iw22_scenario
+
+        text = """
+INSPECTION REPORT DGA-B17/FO/STP/INS
+73234930               Serial number :  N/A P6 Structure
+PAZ/FPSOT/HSG/STRUC /P6 Pedro Castelo 2026-03-22
+General Comments
+- A close visual inspection was carried out on P6 Structural Module.
+Findings:
+- Coating failure, general corrosion, and areas with severe corrosion were noted on cable tray supports and handrails
+Recommendations:
+- Paint touch up to be done
+"""
+        sentence = iw22_scenario.summarize_text(text)
+        self.assertIn("P6", sentence)
+        self.assertRegex(sentence.lower(), r"coating|corrosion|handrail")
+        self.assertLessEqual(sentence.count("."), 2)
+
+    def test_lookup_splits_by_fpso_and_adds_scenario(self):
+        from iw29_export import iw22_lookup
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            gir = root / "GIR"
+            gir.mkdir()
+            # Minimal fake PDF is not needed when fill_scenario=False
+            (gir / "12345678.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+            dest = root / "iw22_notification_lookup.xlsx"
+            result = iw22_lookup.build_lookup_xlsx(
+                [("GIR", gir)],
+                dest,
+                fill_scenario=False,
+                split_by_fpso=True,
+                write_combined=True,
+            )
+            self.assertEqual(result.row_count, 1)
+            self.assertTrue(dest.is_file())
+            split = root / "iw22_notification_lookup_GIR.xlsx"
+            self.assertTrue(split.is_file())
+            self.assertIn(split, result.paths)
 
 
 if __name__ == "__main__":

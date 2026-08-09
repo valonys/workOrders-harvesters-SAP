@@ -22,6 +22,8 @@ COMMANDS = (
     "inspect",
     "sync-master",
     "iw22-attachments",
+    "iw22-merge-pdfs",
+    "iw22-lookup",
     "iw38",
     "iw38-kpi",
     "archive",
@@ -37,6 +39,8 @@ commands:
   inspect             open the transaction and dump the real screen element ids
   sync-master         copy the latest harvest A2:N into the master Open_NINC sheet
   iw22-attachments    open each notification in IW22 and harvest its GOS attachment
+  iw22-merge-pdfs     merge notif(1).pdf + (2).pdf + … into notif.pdf per batch folder
+  iw22-lookup         rebuild per-FPSO Excel lists with Scenario summaries
   iw38                harvest IW39 order lists for the configured PG2026 variants
   iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
   archive             only file away old reports
@@ -50,6 +54,8 @@ examples:
   iw29-export run --days 7               last 7 days into the synced folder
   iw29-export sync-master                refresh Open_NINC from the latest harvest
   iw29-export iw22-attachments           harvest attachments for the configured list
+  iw29-export iw22-merge-pdfs --batch GIR
+  iw29-export iw22-lookup                rebuild GIR/DAL/PAZ/CLV lookup + Scenario
   iw29-export iw38                       download configured IW38/IW39 variants
   iw29-export iw38-kpi                   rebuild CLV Performance/Backlog smoke KPIs
   iw29-export archive --dry-run          show what housekeeping would do
@@ -96,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="inspect command only: run the report first and dump the result screen",
     )
+    parser.add_argument(
+        "--batch",
+        action="append",
+        dest="batches",
+        help="iw22-attachments only: run one FPSO batch (repeatable: GIR, DAL, PAZ, CLV)",
+    )
     return parser
 
 
@@ -120,6 +132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "inspect": _command_inspect,
         "sync-master": _command_sync_master,
         "iw22-attachments": _command_iw22_attachments,
+        "iw22-merge-pdfs": _command_iw22_merge_pdfs,
+        "iw22-lookup": _command_iw22_lookup,
         "iw38": _command_iw38,
         "iw38-kpi": _command_iw38_kpi,
         "archive": _command_archive,
@@ -238,10 +252,9 @@ def _command_sync_master(config: Config, args: argparse.Namespace) -> int:
 def _command_iw22_attachments(config: Config, args: argparse.Namespace) -> int:
     from . import iw22_attachments
 
-    del args
     if not config.iw22_attachments.enabled:
         config = config.with_overrides(**{"iw22_attachments.enabled": True})
-    result = iw22_attachments.run(config)
+    result = iw22_attachments.run(config, batch_names=args.batches)
     print(
         f"IW22 attachments: {result.saved} saved, {result.skipped} skipped, "
         f"{result.failed} failed"
@@ -250,8 +263,68 @@ def _command_iw22_attachments(config: Config, args: argparse.Namespace) -> int:
         paths = item.paths or ([item.path] if item.path else [])
         where = f" -> {', '.join(p.name for p in paths)}" if paths else ""
         detail = f" ({item.detail})" if item.detail else ""
-        print(f"  [{item.status}] {item.notification}{where}{detail}")
+        batch = f"{item.batch} " if item.batch else ""
+        print(f"  [{item.status}] {batch}{item.notification}{where}{detail}")
     return 1 if result.failed and result.saved == 0 else 0
+
+
+def _command_iw22_merge_pdfs(config: Config, args: argparse.Namespace) -> int:
+    from . import iw22_attachments, pdf_merge
+
+    if not config.iw22_attachments.enabled:
+        config = config.with_overrides(**{"iw22_attachments.enabled": True})
+    jobs = iw22_attachments._resolve_jobs(config, args.batches)
+    if not jobs:
+        print("No IW22 batch folders configured.", file=sys.stderr)
+        return 2
+    keep = config.iw22_attachments.merge_keep_parts
+    exit_code = 0
+    for name, _list_path, out_dir in jobs:
+        result = pdf_merge.merge_folder(out_dir, keep_parts=keep)
+        print(
+            f"[{name}] merged {result.merged_count} in {out_dir} "
+            f"(skipped {len(result.skipped)}, errors {len(result.errors)})"
+        )
+        for path in result.merged:
+            print(f"  -> {path.name}")
+        for err in result.errors:
+            print(f"  [error] {err}", file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+def _command_iw22_lookup(config: Config, args: argparse.Namespace) -> int:
+    from . import iw22_attachments, iw22_lookup
+
+    if not config.iw22_attachments.enabled:
+        config = config.with_overrides(**{"iw22_attachments.enabled": True})
+    cfg = config.iw22_attachments
+    jobs = iw22_attachments._resolve_jobs(config, args.batches)
+    if not jobs and cfg.batches and not args.batches:
+        base = cfg.output_folder or (config.export.folder / "iw22_attachments")
+        jobs = [
+            (batch.name, batch.list_path, batch.output_folder or (base / batch.name))
+            for batch in cfg.batches
+        ]
+    if not jobs:
+        print("No IW22 batch folders configured.", file=sys.stderr)
+        return 2
+    destination = cfg.lookup_xlsx_path or (
+        (cfg.output_folder or (config.export.folder / "iw22_attachments"))
+        / "iw22_notification_lookup.xlsx"
+    )
+    result = iw22_lookup.build_lookup_xlsx(
+        [(name, out_dir) for name, _list, out_dir in jobs],
+        destination,
+        sheet_name=cfg.lookup_sheet_name,
+        fill_scenario=cfg.fill_scenario,
+        scenario_max_pages=cfg.scenario_max_pages,
+        split_by_fpso=cfg.lookup_split_by_fpso,
+        write_combined=cfg.lookup_write_combined,
+    )
+    names = ", ".join(p.name for p in result.paths) or result.path.name
+    print(f"IW22 lookup: {result.row_count} notification(s) -> {names}")
+    return 0
 
 
 def _command_iw38(config: Config, args: argparse.Namespace) -> int:

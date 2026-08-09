@@ -120,10 +120,11 @@ dest_sheet = "Open_NINC"
 formula_last_col = 38
 
 # Open each notification in IW22, open GOS attachments, save one file per number.
-# List file: .txt (one number per line), .csv or .xlsx.
+# Prefer [[iw22_attachments.batches]] (GIR/DAL/PAZ/CLV) over a single list_path.
+# Files are named <notif>(1).ext … ; .log/.txt sidecars are skipped.
 [iw22_attachments]
 enabled = false
-list_path = ""               # e.g. C:\Users\...\IW29\iw22_notification_list.txt
+list_path = ""               # legacy single list (unused when batches are set)
 list_column = "Notification"
 list_sheet = ""
 attachment_mode = "all"      # first | match | all
@@ -132,10 +133,27 @@ output_folder = ""           # blank = <export.folder>\iw22_attachments
 download_watch_folder = ""   # blank = user Downloads
 download_timeout_s = 45
 limit = 0                    # 0 = whole list; files named <notif>(1).ext …
+skip_extensions = [".log", ".txt"]
+merge_pdfs = true                # merge notif(1).pdf + (2) + … → notif.pdf
+merge_keep_parts = false         # delete split parts after merge (saves space)
+build_lookup_xlsx = true         # Excel list of harvested notifications for XLOOKUP
+lookup_xlsx_path = ""            # blank = <output_folder>\iw22_notification_lookup.xlsx
+lookup_sheet_name = "Lookup"
+lookup_split_by_fpso = true      # also write iw22_notification_lookup_{GIR,DAL,PAZ,CLV}.xlsx
+lookup_write_combined = true     # keep the combined workbook as well
+fill_scenario = true             # one natural-language Scenario sentence per PDF
+scenario_max_pages = 6           # pages scanned for Scenario text extraction
+
+# [[iw22_attachments.batches]]
+# name = "GIR"
+# list_path = 'C:\Users\...\IW29\iw22_notification_list_GIR.txt'
+# output_folder = 'C:\Users\...\IW29\iw22_attachments\GIR'
 
 # IW39 order lists for Power BI (folder conventionally named IW38).
 # Mirrors LaunchSAP.txt: Outstanding + Historical, then Get Variant.
 # filename_pattern has no date so each variant overwrites a stable path.
+# Order is forced to text; Item Class (col A) is restored each harvest from
+# dataset\{SITE}_item_class_lookup.csv so Excel date-corruption cannot break it.
 [iw38]
 enabled = false
 transaction = "IW39"

@@ -6,3 +6,6 @@ keyring>=24.3.0
 # Only needed for export.mode = "native_xlsx", which reads back a workbook SAP
 # wrote itself. The default mode does not need this.
 openpyxl>=3.1.2
+
+# Merge split IW22 attachment PDFs: notif(1).pdf + notif(2).pdf → notif.pdf
+pypdf>=4.0.0

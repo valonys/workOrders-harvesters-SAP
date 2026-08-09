@@ -269,12 +269,8 @@ def _item_class_from_headers(headers: Sequence[str], row: Sequence[Any]) -> str:
 
 
 def _order_key(order: Any) -> str:
-    if order is None:
-        return ""
-    text = str(order).strip()
-    if text.endswith(".0"):
-        text = text[:-2]
-    return text
+    """Stable Order key; repairs date-mangled values such as ``7323-10-22``."""
+    return convert.identifier_text(order)
 
 
 def load_item_class_lookup(folder: Path, variant: str) -> Dict[str, str]:
@@ -331,18 +327,73 @@ def save_item_class_lookup(folder: Path, variant: str, table: convert.Table) -> 
             klass = str(row[class_idx] if class_idx < len(row) else "").strip()
             if not key or not klass or key in seen:
                 continue
+            if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
+                continue
             seen.add(key)
             writer.writerow([key, klass])
+    return path
+
+
+def write_item_class_lookup_xlsx(
+    folder: Path, variant: str, table: convert.Table
+) -> Path:
+    """Write a stable 2-column workbook for Excel XLOOKUP against Order."""
+    dataset_dir = folder / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    site = _site_code(variant)
+    path = dataset_dir / f"{site}_item_class_lookup.xlsx"
+    order_idx = _col(table.headers, "Order")
+    class_idx = next(
+        (
+            i
+            for i, header in enumerate(table.headers)
+            if str(header or "").strip().lower() in _ITEM_CLASS_HEADERS
+        ),
+        None,
+    )
+    rows: List[List[object]] = []
+    seen = set()
+    if order_idx is not None and class_idx is not None:
+        for row in table.rows:
+            key = _order_key(row[order_idx] if order_idx < len(row) else "")
+            klass = str(row[class_idx] if class_idx < len(row) else "").strip()
+            if not key or not klass or key in seen:
+                continue
+            if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
+                continue
+            seen.add(key)
+            rows.append([key, klass])
+    rows.sort(key=lambda item: str(item[0]))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    xlsx.write(
+        ["Order", "ItemClass"],
+        rows,
+        tmp,
+        sheet_name="Lookup",
+        column_widths=(14, 28),
+    )
+    tmp.replace(path)
     return path
 
 
 def ensure_item_class_column(
     table: convert.Table, lookup: Dict[str, str]
 ) -> convert.Table:
-    """Guarantee headers start with Item Class, filled from col A or Order lookup."""
+    """Guarantee headers start with Item Class, filled from col A or Order lookup.
+
+    Order is always normalised to text so weekly harvests cannot reintroduce
+    Excel date corruption that breaks XLOOKUP / cache keys.
+    """
+    table = convert.normalise_identifier_columns(table)
     headers = list(table.headers)
     has_class = any(str(h or "").strip().lower() in _ITEM_CLASS_HEADERS for h in headers)
     order_idx = _col(headers, "Order")
+    # Normalise lookup keys once up front.
+    clean_lookup = {
+        _order_key(key): str(value).strip()
+        for key, value in lookup.items()
+        if _order_key(key) and str(value).strip()
+    }
     new_rows: List[List[Any]] = []
     if has_class:
         class_idx = next(
@@ -354,9 +405,16 @@ def ensure_item_class_column(
             values = list(row)
             while len(values) < len(headers):
                 values.append(None)
+            if order_idx is not None:
+                values[order_idx] = _order_key(values[order_idx])
             current = str(values[class_idx] or "").strip()
+            # Ignore leftover formula text if a cached value was not available.
+            if current.upper().startswith("IFERROR") or "XLOOKUP" in current.upper():
+                current = ""
             if not current and order_idx is not None:
-                values[class_idx] = lookup.get(_order_key(values[order_idx]), "")
+                values[class_idx] = clean_lookup.get(values[order_idx], "")
+            else:
+                values[class_idx] = current
             new_rows.append(values)
         return convert.Table(headers=headers, rows=new_rows)
 
@@ -364,8 +422,14 @@ def ensure_item_class_column(
     new_headers = ["Item Class", *headers]
     for row in table.rows:
         values = list(row)
-        order = values[order_idx] if order_idx is not None and order_idx < len(values) else ""
-        klass = lookup.get(_order_key(order), "")
+        order = (
+            _order_key(values[order_idx])
+            if order_idx is not None and order_idx < len(values)
+            else ""
+        )
+        if order_idx is not None and order_idx < len(values):
+            values[order_idx] = order
+        klass = clean_lookup.get(order, "")
         new_rows.append([klass, *values])
     return convert.Table(headers=new_headers, rows=new_rows)
 
@@ -384,25 +448,35 @@ def _read_lookup_csv(path: Path) -> Dict[str, str]:
 
 def _extract_item_class_map_from_xlsx(path: Path) -> Dict[str, str]:
     """Read Order → Item Class from an enriched workbook (stdlib ZIP/XML)."""
+    import re
     import zipfile
     from xml.etree import ElementTree as ET
 
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     mapping: Dict[str, str] = {}
+
+    def col_index(cell_ref: str) -> int:
+        letters = re.match(r"([A-Z]+)", cell_ref or "")
+        if not letters:
+            return 0
+        number = 0
+        for char in letters.group(1):
+            number = number * 26 + (ord(char) - 64)
+        return number
+
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
-        if "xl/sharedStrings.xml" not in names:
-            return mapping
         strings: List[str] = []
-        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-        for si in root.findall("m:si", ns):
-            texts = [
-                node.text or ""
-                for node in si.iter(
-                    "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"
-                )
-            ]
-            strings.append("".join(texts))
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", ns):
+                texts = [
+                    node.text or ""
+                    for node in si.iter(
+                        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"
+                    )
+                ]
+                strings.append("".join(texts))
         sheet_name = next(
             (n for n in names if n.startswith("xl/worksheets/sheet")), None
         )
@@ -413,39 +487,71 @@ def _extract_item_class_map_from_xlsx(path: Path) -> Dict[str, str]:
         def cell_val(cell: Any) -> Any:
             kind = cell.attrib.get("t")
             node = cell.find("m:v", ns)
+            inline = cell.find("m:is", ns)
+            if kind == "inlineStr" and inline is not None:
+                return "".join(
+                    node.text or ""
+                    for node in inline.iter(
+                        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"
+                    )
+                )
             if node is None:
                 return None
             if kind == "s":
-                return strings[int(node.text)]
-            return node.text
+                index = int(node.text)
+                return strings[index] if 0 <= index < len(strings) else None
+            text = node.text
+            # Numeric cells may be mangled date serials for Order.
+            try:
+                number = float(text)
+            except (TypeError, ValueError):
+                return text
+            if number.is_integer():
+                return int(number)
+            return number
 
         rows = sheet.findall("m:sheetData/m:row", ns)
         if not rows:
             return mapping
-        header = [cell_val(c) for c in rows[0].findall("m:c", ns)]
-        # Drop blank header slots from Excel quirks.
-        class_idx = next(
+
+        def row_values(row_el: Any) -> Dict[int, Any]:
+            values: Dict[int, Any] = {}
+            for cell in row_el.findall("m:c", ns):
+                index = col_index(cell.attrib.get("r", ""))
+                if index:
+                    values[index] = cell_val(cell)
+            return values
+
+        header_map = row_values(rows[0])
+        if not header_map:
+            return mapping
+        class_col = next(
             (
-                i
-                for i, h in enumerate(header)
-                if str(h or "").strip().lower() in _ITEM_CLASS_HEADERS
+                index
+                for index, header in header_map.items()
+                if str(header or "").strip().lower() in _ITEM_CLASS_HEADERS
             ),
             None,
         )
-        order_idx = next(
-            (i for i, h in enumerate(header) if str(h or "").strip().lower() == "order"),
+        order_col = next(
+            (
+                index
+                for index, header in header_map.items()
+                if str(header or "").strip().lower() == "order"
+            ),
             None,
         )
-        if class_idx is None or order_idx is None:
+        if class_col is None or order_col is None:
             return mapping
         for row in rows[1:]:
-            vals = [cell_val(c) for c in row.findall("m:c", ns)]
-            if max(class_idx, order_idx) >= len(vals):
+            values = row_values(row)
+            key = _order_key(values.get(order_col))
+            klass = str(values.get(class_col) or "").strip()
+            if not key or not klass:
                 continue
-            key = _order_key(vals[order_idx])
-            klass = str(vals[class_idx] or "").strip()
-            if key and klass:
-                mapping[key] = klass
+            if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
+                continue
+            mapping[key] = klass
     return mapping
 
 
@@ -777,12 +883,19 @@ def _as_date(value: Any) -> Optional[date]:
         return value.date()
     if isinstance(value, date):
         return value
+    # Stdlib xlsx reads often leave Excel day-serials as ints.
+    coerced = convert.excel_serial_to_date(value)
+    if isinstance(coerced, date):
+        return coerced
     text = str(value).strip()
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y%m%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(text[:10], fmt).date()
+            parsed = datetime.strptime(text[:10], fmt).date()
         except ValueError:
             continue
+        if fmt == "%Y%m%d" and not (1990 <= parsed.year <= 2100):
+            continue
+        return parsed
     return None
 
 

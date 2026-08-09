@@ -183,10 +183,20 @@ class MasterDashboardConfig:
 
 
 @dataclass
+class Iw22BatchConfig:
+    """One FPSO workhorse list → dedicated output folder."""
+
+    name: str
+    list_path: Path
+    output_folder: Optional[Path] = None
+
+
+@dataclass
 class Iw22AttachmentsConfig:
     """Harvest GOS attachments from IW22 for each number in a list file."""
 
     enabled: bool = False
+    # Legacy single-list mode (used when batches is empty).
     list_path: Optional[Path] = None
     list_column: str = "Notification"
     list_sheet: str = ""
@@ -197,6 +207,26 @@ class Iw22AttachmentsConfig:
     download_watch_folder: Optional[Path] = None
     download_timeout_s: int = 45
     limit: int = 0  # 0 = all
+    # Skip SAP noise files (e.g. GOS .log / .txt sidecars).
+    skip_extensions: List[str] = field(
+        default_factory=lambda: [".log", ".txt"]
+    )
+    # De-facto workhorse harvesters: GIR / DAL / PAZ / CLV.
+    batches: List[Iw22BatchConfig] = field(default_factory=list)
+    # After harvest, merge notif(1).pdf + notif(2).pdf + … → notif.pdf
+    merge_pdfs: bool = True
+    # False = delete the split parts after a successful merge (saves OneDrive space).
+    merge_keep_parts: bool = False
+    # Excel list of harvested notification PDFs for XLOOKUP.
+    build_lookup_xlsx: bool = True
+    lookup_xlsx_path: Optional[Path] = None
+    lookup_sheet_name: str = "Lookup"
+    # Split into iw22_notification_lookup_{GIR,DAL,PAZ,CLV}.xlsx beside the combined file.
+    lookup_split_by_fpso: bool = True
+    lookup_write_combined: bool = True
+    # Fill Scenario from PDF text (one natural-language sentence per notification).
+    fill_scenario: bool = True
+    scenario_max_pages: int = 6
 
 
 @dataclass
@@ -351,17 +381,29 @@ class Config:
                     "master_dashboard.formula_last_col must be >= 14 (column N)."
                 )
         if self.iw22_attachments.enabled:
-            if not self.iw22_attachments.list_path:
+            cfg = self.iw22_attachments
+            if not cfg.batches and not cfg.list_path:
                 raise ConfigError(
-                    "iw22_attachments.list_path must be set when enabled is true."
+                    "iw22_attachments needs list_path or [[iw22_attachments.batches]]."
                 )
-            mode = self.iw22_attachments.attachment_mode.strip().lower()
+            for batch in cfg.batches:
+                if not batch.name.strip():
+                    raise ConfigError("iw22_attachments.batches.name must be set.")
+                if not str(batch.list_path).strip():
+                    raise ConfigError(
+                        f"iw22_attachments batch '{batch.name}' needs list_path."
+                    )
+            mode = cfg.attachment_mode.strip().lower()
             if mode not in {"first", "match", "all"}:
                 raise ConfigError(
                     "iw22_attachments.attachment_mode must be "
                     "'first', 'match' or 'all'."
                 )
             self.iw22_attachments.attachment_mode = mode
+            self.iw22_attachments.skip_extensions = [
+                ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+                for ext in cfg.skip_extensions
+            ]
         if self.iw38.enabled:
             if not self.iw38.variants:
                 raise ConfigError("iw38.variants must list at least one name.")
@@ -605,6 +647,28 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
     list_path = _str(raw, "iw22_attachments.list_path", "").strip()
     output = _str(raw, "iw22_attachments.output_folder", "").strip()
     watch = _str(raw, "iw22_attachments.download_watch_folder", "").strip()
+    lookup_path = _str(raw, "iw22_attachments.lookup_xlsx_path", "").strip()
+    skip_raw = raw.get("skip_extensions", [".log", ".txt"])
+    if isinstance(skip_raw, str):
+        skip_exts = [skip_raw]
+    elif isinstance(skip_raw, (list, tuple)):
+        skip_exts = [str(item).strip() for item in skip_raw if str(item).strip()]
+    else:
+        raise ConfigError("iw22_attachments.skip_extensions must be a list.")
+    batches: List[Iw22BatchConfig] = []
+    for entry in _list_of_tables(raw, "iw22_attachments.batches"):
+        name = _str(entry, "iw22_attachments.batches.name", "").strip()
+        batch_list = _str(entry, "iw22_attachments.batches.list_path", "").strip()
+        batch_out = _str(entry, "iw22_attachments.batches.output_folder", "").strip()
+        if not name and not batch_list:
+            continue
+        batches.append(
+            Iw22BatchConfig(
+                name=name,
+                list_path=Path(batch_list).expanduser(),
+                output_folder=Path(batch_out).expanduser() if batch_out else None,
+            )
+        )
     return Iw22AttachmentsConfig(
         enabled=_bool(raw, "iw22_attachments.enabled", False),
         list_path=Path(list_path).expanduser() if list_path else None,
@@ -618,6 +682,26 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
         download_watch_folder=Path(watch).expanduser() if watch else None,
         download_timeout_s=_int(raw, "iw22_attachments.download_timeout_s", 45),
         limit=_int(raw, "iw22_attachments.limit", 0),
+        skip_extensions=skip_exts or [".log", ".txt"],
+        batches=batches,
+        merge_pdfs=_bool(raw, "iw22_attachments.merge_pdfs", True),
+        merge_keep_parts=_bool(raw, "iw22_attachments.merge_keep_parts", False),
+        build_lookup_xlsx=_bool(raw, "iw22_attachments.build_lookup_xlsx", True),
+        lookup_xlsx_path=(
+            Path(lookup_path).expanduser() if lookup_path else None
+        ),
+        lookup_sheet_name=_str(
+            raw, "iw22_attachments.lookup_sheet_name", "Lookup"
+        ).strip()
+        or "Lookup",
+        lookup_split_by_fpso=_bool(
+            raw, "iw22_attachments.lookup_split_by_fpso", True
+        ),
+        lookup_write_combined=_bool(
+            raw, "iw22_attachments.lookup_write_combined", True
+        ),
+        fill_scenario=_bool(raw, "iw22_attachments.fill_scenario", True),
+        scenario_max_pages=_int(raw, "iw22_attachments.scenario_max_pages", 6),
     )
 
 

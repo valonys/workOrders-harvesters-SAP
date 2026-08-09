@@ -55,6 +55,7 @@ class AttachmentResult:
     path: Optional[Path] = None
     paths: List[Path] = field(default_factory=list)
     detail: str = ""
+    batch: str = ""
 
 
 @dataclass
@@ -76,22 +77,23 @@ class HarvestResult:
         return sum(1 for item in self.results if item.status == "skipped")
 
 
-def run(config: Config, progress: Optional[ProgressFn] = None) -> HarvestResult:
+def run(
+    config: Config,
+    progress: Optional[ProgressFn] = None,
+    batch_names: Optional[List[str]] = None,
+) -> HarvestResult:
     emit = progress or (lambda message: log.info("%s", message))
     cfg = config.iw22_attachments
     if not cfg.enabled:
         raise ConfigError("iw22_attachments.enabled is false.")
-    if not cfg.list_path:
-        raise ConfigError("iw22_attachments.list_path must be set.")
 
-    numbers = load_notification_numbers(
-        cfg.list_path, column=cfg.list_column, sheet=cfg.list_sheet
-    )
-    if cfg.limit > 0:
-        numbers = numbers[: cfg.limit]
+    jobs = _resolve_jobs(config, batch_names)
+    if not jobs:
+        raise ConfigError(
+            "No IW22 harvest jobs configured. Set [[iw22_attachments.batches]] "
+            "or list_path."
+        )
 
-    out_dir = cfg.output_folder or (config.export.folder / "iw22_attachments")
-    out_dir.mkdir(parents=True, exist_ok=True)
     watch_dir = cfg.download_watch_folder or Path.home() / "Downloads"
     watch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,19 +102,85 @@ def run(config: Config, progress: Optional[ProgressFn] = None) -> HarvestResult:
     password = resolve(config)
     gui = SapGui.from_config(config, password)
 
-    emit(f"IW22 attachment harvest: {len(numbers)} notification(s) → {out_dir}")
     with gui.session() as session:
-        for index, number in enumerate(numbers, start=1):
-            emit(f"[{index}/{len(numbers)}] IW22 {number}")
-            try:
-                result = _harvest_one(session, config, number, out_dir, watch_dir)
-            except Exception as exc:
-                log.exception("Failed on notification %s", number)
-                result = AttachmentResult(
-                    notification=number, status="failed", detail=str(exc)
+        for job_name, list_path, out_dir in jobs:
+            numbers = load_notification_numbers(
+                list_path, column=cfg.list_column, sheet=cfg.list_sheet
+            )
+            if cfg.limit > 0:
+                numbers = numbers[: cfg.limit]
+            out_dir.mkdir(parents=True, exist_ok=True)
+            emit(
+                f"IW22 [{job_name}]: {len(numbers)} notification(s) → {out_dir}"
+            )
+            for index, number in enumerate(numbers, start=1):
+                emit(f"[{job_name} {index}/{len(numbers)}] IW22 {number}")
+                try:
+                    result = _harvest_one(
+                        session, config, number, out_dir, watch_dir
+                    )
+                except Exception as exc:
+                    log.exception("Failed on notification %s", number)
+                    result = AttachmentResult(
+                        notification=number,
+                        status="failed",
+                        detail=str(exc),
+                        batch=job_name,
+                    )
+                result.batch = job_name
+                results.append(result)
+                _close_attachment_dialogs(session)
+
+            if cfg.merge_pdfs:
+                from . import pdf_merge
+
+                merge = pdf_merge.merge_folder(
+                    out_dir,
+                    keep_parts=cfg.merge_keep_parts,
+                    notifications=numbers,
                 )
-            results.append(result)
-            _close_attachment_dialogs(session)
+                emit(
+                    f"IW22 [{job_name}] PDF merge: {merge.merged_count} combined, "
+                    f"{len(merge.skipped)} skipped, {len(merge.errors)} error(s)"
+                )
+                for err in merge.errors:
+                    log.warning("PDF merge %s: %s", job_name, err)
+
+    if cfg.build_lookup_xlsx:
+        from . import iw22_lookup
+
+        lookup_jobs = _resolve_jobs(config, batch_names)
+        batch_folders = [(name, out_dir) for name, _list, out_dir in lookup_jobs]
+        # When a subset of batches is requested, still rebuild from those folders;
+        # for a full run include every configured batch folder.
+        if not batch_names and cfg.batches:
+            base = cfg.output_folder or (config.export.folder / "iw22_attachments")
+            batch_folders = [
+                (batch.name, batch.output_folder or (base / batch.name))
+                for batch in cfg.batches
+            ]
+        destination = cfg.lookup_xlsx_path or (
+            (cfg.output_folder or (config.export.folder / "iw22_attachments"))
+            / "iw22_notification_lookup.xlsx"
+        )
+        try:
+            lookup = iw22_lookup.build_lookup_xlsx(
+                batch_folders,
+                destination,
+                sheet_name=cfg.lookup_sheet_name,
+                fill_scenario=cfg.fill_scenario,
+                scenario_max_pages=cfg.scenario_max_pages,
+                split_by_fpso=cfg.lookup_split_by_fpso,
+                write_combined=cfg.lookup_write_combined,
+            )
+            names = ", ".join(p.name for p in lookup.paths) or lookup.path.name
+            emit(
+                f"IW22 lookup workbook: {lookup.row_count} notification(s) → "
+                f"{names}"
+            )
+        except Exception as exc:
+            log.exception("Failed building IW22 lookup workbook")
+            emit(f"IW22 lookup workbook failed: {exc}")
 
     finished = datetime.now()
     summary = HarvestResult(started_at=started, finished_at=finished, results=results)
@@ -125,6 +193,29 @@ def run(config: Config, progress: Optional[ProgressFn] = None) -> HarvestResult:
     return summary
 
 
+def _resolve_jobs(
+    config: Config, batch_names: Optional[List[str]]
+) -> List[tuple]:
+    """Return (name, list_path, output_folder) jobs to run."""
+    cfg = config.iw22_attachments
+    base = cfg.output_folder or (config.export.folder / "iw22_attachments")
+    wanted = {name.strip().upper() for name in (batch_names or []) if name.strip()}
+
+    jobs: List[tuple] = []
+    if cfg.batches:
+        for batch in cfg.batches:
+            name = batch.name.strip()
+            if wanted and name.upper() not in wanted:
+                continue
+            out = batch.output_folder or (base / name)
+            jobs.append((name, batch.list_path, out))
+        return jobs
+
+    if cfg.list_path:
+        jobs.append(("default", cfg.list_path, base))
+    return jobs
+
+
 def _harvest_one(
     session: SapSession,
     config: Config,
@@ -133,6 +224,7 @@ def _harvest_one(
     watch_dir: Path,
 ) -> AttachmentResult:
     cfg = config.iw22_attachments
+    skip_exts = {ext.lower() for ext in cfg.skip_extensions}
     _open_notification(session, number)
 
     if not _open_attachment_list(session):
@@ -161,10 +253,21 @@ def _harvest_one(
     saved_paths: List[Path] = []
     already: List[Path] = []
     errors: List[str] = []
+    skipped_noise = 0
     watch_dirs = _watch_dirs(watch_dir)
+    seq = 0
 
-    for seq, row in enumerate(rows, start=1):
-        existing = _existing_destination(out_dir, number, seq)
+    for row in rows:
+        description = _cell_text(grid, row, "BITM_DESCR") or f"row{row}"
+        if _is_noise_attachment(description, skip_exts):
+            skipped_noise += 1
+            log.info(
+                "Skipping noise attachment on %s: %s", number, description
+            )
+            continue
+
+        seq += 1
+        existing = _existing_destination(out_dir, number, seq, skip_exts)
         if existing is not None:
             already.append(existing)
             log.info("Already have %s — skipping index %s.", existing.name, seq)
@@ -175,9 +278,6 @@ def _harvest_one(
             errors.append(f"index {seq}: attachment list unavailable")
             break
 
-        # Row indexes are stable for the current open list; after a reopen the
-        # same absolute row still corresponds to the same attachment order.
-        description = _cell_text(grid, row, "BITM_DESCR") or f"row{row}"
         before = {folder: _snapshot_files(folder) for folder in watch_dirs}
         before[out_dir] = _snapshot_files(out_dir)
 
@@ -185,19 +285,40 @@ def _harvest_one(
             session, grid, row, out_dir, number, seq, description
         ):
             errors.append(f"row {row}: could not export/open")
-            grid = None  # force reopen on next index
+            grid = None
             continue
 
-        saved = _wait_for_new_file_any(before, timeout_s=cfg.download_timeout_s)
+        saved = _wait_for_new_file_any(
+            before, timeout_s=cfg.download_timeout_s, skip_exts=skip_exts
+        )
         if saved is None:
             errors.append(
-                f"row {row}: no new file under "
+                f"row {row}: no new non-noise file under "
                 + ", ".join(str(p) for p in [*watch_dirs, out_dir])
             )
             grid = None
             continue
 
+        if _is_noise_path(saved, skip_exts):
+            try:
+                saved.unlink()
+            except OSError:
+                pass
+            skipped_noise += 1
+            log.info("Deleted noise download %s", saved.name)
+            grid = None
+            continue
+
         target = _destination(out_dir, number, seq, saved)
+        if _is_noise_path(target, skip_exts):
+            try:
+                saved.unlink()
+            except OSError:
+                pass
+            skipped_noise += 1
+            grid = None
+            continue
+
         if saved.resolve() != target.resolve():
             if target.exists():
                 try:
@@ -210,8 +331,7 @@ def _harvest_one(
             shutil.move(str(saved), str(target))
         saved_paths.append(target)
         log.info("Saved %s → %s (%s)", number, target.name, description)
-        grid = None  # list often closes after export; reopen for the next file
-
+        grid = None
 
     all_paths = already + saved_paths
     if saved_paths:
@@ -231,6 +351,12 @@ def _harvest_one(
             path=already[0],
             paths=already,
             detail=f"already harvested: {names}",
+        )
+    if skipped_noise and not errors and not already:
+        return AttachmentResult(
+            notification=number,
+            status="skipped",
+            detail=f"only noise attachments (.log/.txt) found ({skipped_noise})",
         )
     return AttachmentResult(
         notification=number,
@@ -469,8 +595,11 @@ def _watch_dirs(primary: Path) -> List[Path]:
 
 
 def _wait_for_new_file_any(
-    before_by_folder: dict, timeout_s: float = 45.0
+    before_by_folder: dict,
+    timeout_s: float = 45.0,
+    skip_exts: Optional[set] = None,
 ) -> Optional[Path]:
+    skip_exts = {ext.lower() for ext in (skip_exts or set())}
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         for folder, before in before_by_folder.items():
@@ -478,8 +607,13 @@ def _wait_for_new_file_any(
                 for path in folder.iterdir():
                     if not path.is_file() or path.name.startswith("~$"):
                         continue
-                    # Ignore trivial temp noise.
-                    if path.suffix.lower() in {".tmp", ".partial", ".crdownload"}:
+                    # Ignore trivial temp noise and configured skip extensions.
+                    if path.suffix.lower() in {
+                        ".tmp",
+                        ".partial",
+                        ".crdownload",
+                        *skip_exts,
+                    }:
                         continue
                     previous = before.get(path.name)
                     try:
@@ -521,18 +655,40 @@ def _destination(out_dir: Path, number: str, seq: int, source: Path) -> Path:
     return out_dir / f"{number}({seq}){suffix}"
 
 
-def _existing_destination(out_dir: Path, number: str, seq: int) -> Optional[Path]:
-    """Return an already-harvested file for this notification index, if any."""
+def _existing_destination(
+    out_dir: Path,
+    number: str,
+    seq: int,
+    skip_exts: Optional[set] = None,
+) -> Optional[Path]:
+    """Return an already-harvested non-noise file for this notification index."""
+    skip_exts = {ext.lower() for ext in (skip_exts or set())}
     prefix = f"{number}({seq})"
     try:
         for path in out_dir.iterdir():
             if not path.is_file():
+                continue
+            if _is_noise_path(path, skip_exts):
                 continue
             if path.stem == prefix or path.name.startswith(prefix + "."):
                 return path
     except OSError:
         pass
     return None
+
+
+def _is_noise_path(path: Path, skip_exts: set) -> bool:
+    return path.suffix.lower() in skip_exts
+
+
+def _is_noise_attachment(description: str, skip_exts: set) -> bool:
+    text = (description or "").strip().lower()
+    if not text:
+        return False
+    suffix = Path(text).suffix.lower()
+    if suffix in skip_exts:
+        return True
+    return any(text.endswith(ext) for ext in skip_exts)
 
 
 def re_slug(text: str) -> str:

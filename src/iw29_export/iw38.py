@@ -180,30 +180,48 @@ def _harvest_variant(
 
     stamp = datetime.now()
     filename = _render_filename(cfg.filename_pattern, job.sap.system, variant, stamp)
+    destination = out_dir / filename
+    table = convert.normalise_identifier_columns(table)
+
+    # Persist Item Class across weekly harvests: read the previous workbook and
+    # the Order→ItemClass cache before we overwrite the stable path.
+    from . import iw38_kpi
+
+    lookup = iw38_kpi.load_item_class_lookup(out_dir, variant)
+    if destination.is_file():
+        try:
+            prior = iw38_kpi._extract_item_class_map_from_xlsx(destination)
+            if prior:
+                lookup.update(prior)
+                progress(
+                    f"{variant}: preserved {len(prior)} Item Class value(s) "
+                    "from previous workbook"
+                )
+        except Exception as exc:
+            log.info("Could not read prior Item Class from %s: %s", destination.name, exc)
+
+    enriched = table
+    if cfg.build_kpi:
+        enriched = iw38_kpi.ensure_item_class_column(table, lookup)
+        iw38_kpi.save_item_class_lookup(out_dir, variant, enriched)
+        iw38_kpi.write_item_class_lookup_xlsx(out_dir, variant, enriched)
+
     with tempfile.TemporaryDirectory(prefix="iw38-build-", dir=str(staging)) as scratch:
         built = Path(scratch) / filename
-        if extract.kind == "xlsx" and cfg.mode == "native_xlsx":
+        if (
+            extract.kind == "xlsx"
+            and cfg.mode == "native_xlsx"
+            and not cfg.build_kpi
+        ):
             shutil.copy2(extract.path, built)
         else:
-            convert.write_xlsx(table, built, cfg.sheet_name)
-        published = files.publish(built, out_dir / filename, overwrite=True)
+            # Always rewrite so Order stays text and Item Class (col A) is restored.
+            convert.write_xlsx(enriched, built, cfg.sheet_name)
+        published = files.publish(built, destination, overwrite=True)
 
-    progress(f"Saved {variant} → {published.name} ({table.row_count:,} rows)")
+    progress(f"Saved {variant} → {published.name} ({enriched.row_count:,} rows)")
     if cfg.build_kpi:
         try:
-            from . import iw38_kpi
-
-            lookup = iw38_kpi.load_item_class_lookup(out_dir, variant)
-            enriched = iw38_kpi.ensure_item_class_column(table, lookup)
-            # Overwrite the stable harvest with col A = Item Class (XLOOKUP values).
-            with tempfile.TemporaryDirectory(
-                prefix="iw38-enrich-", dir=str(staging)
-            ) as scratch:
-                enriched_path = Path(scratch) / published.name
-                convert.write_xlsx(enriched, enriched_path, cfg.sheet_name)
-                published = files.publish(
-                    enriched_path, out_dir / published.name, overwrite=True
-                )
             kpi = iw38_kpi.build_from_table(
                 enriched, out_dir, variant, item_class_by_order=lookup
             )
@@ -225,8 +243,8 @@ def _harvest_variant(
         variant=variant,
         status="saved",
         workbook=published,
-        row_count=table.row_count,
-        detail=f"{table.row_count} rows",
+        row_count=enriched.row_count,
+        detail=f"{enriched.row_count} rows",
     )
 
 

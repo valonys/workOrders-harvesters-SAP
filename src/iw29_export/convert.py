@@ -10,7 +10,7 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -22,10 +22,40 @@ log = get_logger("convert")
 
 _ENCODING_CANDIDATES = ("utf-8-sig", "utf-16", "cp1252", "latin-1")
 _DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y%m%d")
+# YYYYMMDD must stay inside a real calendar window. Without this, SAP order
+# numbers such as 73231022 become date(7323, 10, 22) and break XLOOKUP keys.
+_YYYYMMDD_YEAR_MIN = 1990
+_YYYYMMDD_YEAR_MAX = 2100
+_EXCEL_EPOCH = date(1899, 12, 30)
 _SEPARATOR_LINE = re.compile(r"^[\s|+\-=_]*$")
 _NUMBER_LIKE = re.compile(r"^-?[\d.,\s]+-?$")
 _SEPARATORS = ("\t", "|", ";")
 _PREAMBLE_LIMIT = 30
+
+# Identifier columns must remain text so Excel never re-interprets them as dates.
+_TEXT_ID_HEADERS = frozenset(
+    {
+        "order",
+        "notification",
+        "message",
+        "functional location",
+        "sort field",
+        "revision",
+        "mn.wk.ctr",
+    }
+)
+_DATE_HEADERS = frozenset(
+    {
+        "basic fin.",
+        "bsc start",
+        "actual end",
+        "created on",
+        "schedstart",
+        "sched start",
+        "schedfinish",
+        "sched finish",
+    }
+)
 
 
 @dataclass
@@ -75,12 +105,17 @@ def read_sap_text(path: Path) -> Table:
         # Long lists repeat the page title and header at each page break.
         if cells == header_signature:
             continue
-        rows.append([coerce(cell) for cell in cells])
+        rows.append(
+            [
+                coerce(cell, header=headers[index] if index < len(headers) else "")
+                for index, cell in enumerate(cells)
+            ]
+        )
 
     if not rows:
         raise ExportError(f"{path.name} has a header but no data rows.")
     log.info("Parsed %d data rows across %d columns", len(rows), width)
-    return Table(headers=headers, rows=rows)
+    return normalise_identifier_columns(Table(headers=headers, rows=rows))
 
 
 def _find_header(lines: Sequence[str], name: str) -> Tuple[str, int]:
@@ -119,14 +154,15 @@ def _has_empty_lead_column(raw_rows: Sequence[Sequence[str]]) -> bool:
 
 
 def read_xlsx(path: Path) -> Table:
-    """Read back a workbook SAP produced itself, so the dataset step still works."""
+    """Read back a workbook SAP (or this app) produced.
+
+    Prefers openpyxl when available; otherwise uses a stdlib ZIP/XML reader so
+    corporate machines without PyPI can still repair / re-enrich harvests.
+    """
     try:
         from openpyxl import load_workbook
-    except ImportError as exc:
-        raise ExportError(
-            "Reading a workbook SAP wrote needs openpyxl (pip install openpyxl). "
-            "Switch export.mode to 'text_then_convert' to avoid the dependency."
-        ) from exc
+    except ImportError:
+        return read_xlsx_stdlib(path)
 
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -142,15 +178,129 @@ def read_xlsx(path: Path) -> Table:
             cells = list(raw[:width]) + [None] * max(0, width - len(raw))
             if all(cell in (None, "") for cell in cells):
                 continue
-            rows.append(
-                [coerce(cell) if isinstance(cell, str) else cell for cell in cells]
-            )
+            typed: List[Any] = []
+            for index, cell in enumerate(cells):
+                header = headers[index] if index < len(headers) else ""
+                if _is_text_id_header(header):
+                    typed.append(identifier_text(cell))
+                elif isinstance(cell, str):
+                    typed.append(coerce(cell, header=header))
+                else:
+                    typed.append(cell)
+            rows.append(typed)
     finally:
         workbook.close()
 
     if not rows:
         raise ExportError(f"{path.name} has a header but no data rows.")
-    return Table(headers=headers, rows=rows)
+    return normalise_identifier_columns(Table(headers=headers, rows=rows))
+
+
+def read_xlsx_stdlib(path: Path) -> Table:
+    """Stdlib .xlsx reader (first sheet) used when openpyxl is unavailable."""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+    def col_index(cell_ref: str) -> int:
+        match = re.match(r"([A-Z]+)", cell_ref or "")
+        if not match:
+            return 0
+        number = 0
+        for char in match.group(1):
+            number = number * 26 + (ord(char) - 64)
+        return number
+
+    with zipfile.ZipFile(path) as archive:
+        strings: List[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", ns):
+                texts = [
+                    node.text or ""
+                    for node in si.iter(
+                        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"
+                    )
+                ]
+                strings.append("".join(texts))
+        sheet_name = next(
+            (
+                name
+                for name in archive.namelist()
+                if name.startswith("xl/worksheets/sheet")
+            ),
+            None,
+        )
+        if not sheet_name:
+            raise ExportError(f"{path.name} has no worksheet.")
+        sheet = ET.fromstring(archive.read(sheet_name))
+
+        def cell_val(cell: Any) -> Any:
+            kind = cell.attrib.get("t")
+            node = cell.find("m:v", ns)
+            inline = cell.find("m:is", ns)
+            if kind == "inlineStr" and inline is not None:
+                return "".join(
+                    node.text or ""
+                    for node in inline.iter(
+                        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t"
+                    )
+                )
+            if node is None:
+                return None
+            if kind == "s":
+                index = int(node.text)
+                return strings[index] if 0 <= index < len(strings) else None
+            text = node.text
+            try:
+                number = float(text)
+            except (TypeError, ValueError):
+                return text
+            if number.is_integer():
+                return int(number)
+            return number
+
+        parsed: List[Dict[int, Any]] = []
+        max_col = 0
+        for row in sheet.findall("m:sheetData/m:row", ns):
+            values: Dict[int, Any] = {}
+            for cell in row.findall("m:c", ns):
+                index = col_index(cell.attrib.get("r", ""))
+                if not index:
+                    continue
+                values[index] = cell_val(cell)
+                max_col = max(max_col, index)
+            if values:
+                parsed.append(values)
+
+    if not parsed:
+        raise ExportError(f"{path.name} has no rows.")
+    width = max_col
+    raw_headers = [parsed[0].get(index) for index in range(1, width + 1)]
+    headers = _clean_headers(
+        [str(cell) if cell is not None else "" for cell in raw_headers]
+    )
+    rows: List[List[Any]] = []
+    for values in parsed[1:]:
+        cells = [values.get(index) for index in range(1, width + 1)]
+        if all(cell in (None, "") for cell in cells):
+            continue
+        typed = []
+        for index, cell in enumerate(cells):
+            header = headers[index] if index < len(headers) else ""
+            if _is_text_id_header(header):
+                typed.append(identifier_text(cell))
+            elif _is_date_header(header):
+                typed.append(excel_serial_to_date(cell) if not isinstance(cell, str) else coerce(cell, header=header))
+            elif isinstance(cell, str):
+                typed.append(coerce(cell, header=header))
+            else:
+                typed.append(cell)
+        rows.append(typed)
+    if not rows:
+        raise ExportError(f"{path.name} has a header but no data rows.")
+    return normalise_identifier_columns(Table(headers=headers, rows=rows))
 
 
 def write_xlsx(table: Table, destination: Path, sheet_name: str = "Sheet1") -> Path:
@@ -171,19 +321,26 @@ def write_xlsx(table: Table, destination: Path, sheet_name: str = "Sheet1") -> P
     return destination
 
 
-def coerce(value: str) -> Any:
+def coerce(value: str, header: str = "") -> Any:
     """Best-effort conversion of a SAP cell into a date, number or trimmed string."""
     text = (value or "").strip()
     if not text or text in {"-", "--"}:
         return None
+
+    if _is_text_id_header(header):
+        return identifier_text(text)
 
     for fmt in _DATE_FORMATS:
         try:
             parsed = datetime.strptime(text, fmt)
         except ValueError:
             continue
-        if parsed.year > 1900:
-            return parsed.date()
+        if fmt == "%Y%m%d":
+            if not (_YYYYMMDD_YEAR_MIN <= parsed.year <= _YYYYMMDD_YEAR_MAX):
+                continue
+        elif parsed.year <= 1900:
+            continue
+        return parsed.date()
 
     # Leading zeros are meaningful in SAP keys, so those stay text.
     if _NUMBER_LIKE.match(text) and not (len(text) > 1 and text.startswith("0")):
@@ -191,6 +348,106 @@ def coerce(value: str) -> Any:
         if number is not None:
             return number
     return text
+
+
+def identifier_text(value: Any) -> str:
+    """Canonical text form for Order / Notification-style identifiers.
+
+    Repairs the classic Excel damage where an 8-digit order such as ``73231022``
+    was parsed as ``date(7323, 10, 22)`` and later shown as ``7323-10-22``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return f"{value.year:04d}{value.month:02d}{value.day:02d}"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return str(value).strip()
+        if not numeric.is_integer():
+            return str(value).strip()
+        serial = int(numeric)
+        # Excel date serial left after a mangled YYYYMMDD parse (e.g. 1981006).
+        # Real WO numbers are ~8 digits (>= 1e7) and must stay untouched.
+        if 300_000 <= serial <= 3_000_000:
+            decoded = _EXCEL_EPOCH + timedelta(days=serial)
+            if decoded.year > _YYYYMMDD_YEAR_MAX or decoded.year < _YYYYMMDD_YEAR_MIN:
+                return f"{decoded.year:04d}{decoded.month:02d}{decoded.day:02d}"
+        return str(serial)
+
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    match = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$", text)
+    if match:
+        year, month, day = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
+        if year > _YYYYMMDD_YEAR_MAX or year < _YYYYMMDD_YEAR_MIN:
+            return f"{year:04d}{month:02d}{day:02d}"
+    if text.isdigit():
+        return str(int(text))
+    return text
+
+
+def normalise_identifier_columns(table: Table) -> Table:
+    """Force identifier columns to stable text values (Order, Message, …)."""
+    indexes = [
+        index
+        for index, header in enumerate(table.headers)
+        if _is_text_id_header(header)
+    ]
+    if not indexes:
+        return table
+    rows: List[List[Any]] = []
+    for row in table.rows:
+        values = list(row)
+        while len(values) < len(table.headers):
+            values.append(None)
+        for index in indexes:
+            values[index] = identifier_text(values[index])
+        rows.append(values)
+    return Table(headers=list(table.headers), rows=rows)
+
+
+def excel_serial_to_date(value: Any) -> Any:
+    """Convert an Excel day-serial to ``date`` when it looks like a real date."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, bool) or value is None or value == "":
+        return value
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not numeric.is_integer():
+        return value
+    serial = int(numeric)
+    # Excel dates used in maintenance plans sit roughly in 1955–2119.
+    if 20_000 <= serial <= 80_000:
+        return _EXCEL_EPOCH + timedelta(days=serial)
+    return value
+
+
+def _is_text_id_header(header: str) -> bool:
+    name = re.sub(r"\s+", " ", str(header or "").strip()).lower()
+    name = re.sub(r"\s+\(\d+\)$", "", name)
+    return name in _TEXT_ID_HEADERS
+
+
+def _is_date_header(header: str) -> bool:
+    name = re.sub(r"\s+", " ", str(header or "").strip()).lower()
+    name = re.sub(r"\s+\(\d+\)$", "", name)
+    return name in _DATE_HEADERS
 
 
 def _parse_number(text: str) -> Optional[Any]:
