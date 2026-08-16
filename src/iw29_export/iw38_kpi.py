@@ -318,20 +318,23 @@ def save_item_class_lookup(folder: Path, variant: str, table: convert.Table) -> 
             break
     if order_idx is None or class_idx is None:
         return path
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+    rows: List[List[object]] = []
+    seen = set()
+    for row in table.rows:
+        key = _order_key(row[order_idx] if order_idx < len(row) else "")
+        klass = str(row[class_idx] if class_idx < len(row) else "").strip()
+        if not key or not klass or key in seen:
+            continue
+        if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
+            continue
+        seen.add(key)
+        rows.append([key, klass])
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["Order", "ItemClass"])
-        seen = set()
-        for row in table.rows:
-            key = _order_key(row[order_idx] if order_idx < len(row) else "")
-            klass = str(row[class_idx] if class_idx < len(row) else "").strip()
-            if not key or not klass or key in seen:
-                continue
-            if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
-                continue
-            seen.add(key)
-            writer.writerow([key, klass])
-    return path
+        writer.writerows(rows)
+    return _replace_file(tmp, path)
 
 
 def write_item_class_lookup_xlsx(
@@ -372,8 +375,7 @@ def write_item_class_lookup_xlsx(
         sheet_name="Lookup",
         column_widths=(14, 28),
     )
-    tmp.replace(path)
-    return path
+    return _replace_file(tmp, path)
 
 
 def ensure_item_class_column(
@@ -627,12 +629,13 @@ def _write_matrix_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     _replace_file(tmp, path)
 
 
-def _replace_file(tmp: Path, path: Path) -> None:
+def _replace_file(tmp: Path, path: Path) -> Path:
     import os
 
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.replace(str(tmp), str(path))
+        return path
     except PermissionError:
         # File open in Excel/Power BI — write a sibling refresh copy instead.
         alt = path.with_name(path.stem + "_refresh" + path.suffix)
@@ -642,6 +645,7 @@ def _replace_file(tmp: Path, path: Path) -> None:
             path.name,
             alt.name,
         )
+        return alt
 
 
 def _write_dashboard_xlsx(
