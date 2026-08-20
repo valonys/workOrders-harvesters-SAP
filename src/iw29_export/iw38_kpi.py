@@ -47,11 +47,12 @@ _ITEM_CLASS_HEADERS = ("item class", "itemclass", "equipment class", "equipmentc
 @dataclass
 class KpiBuildResult:
     fact_csv: Path
-    dashboard_xlsx: Path
+    dashboard_xlsx: Optional[Path]
     total_orders: int
     completed: int
     performance_pct: float
     backlog: int
+    site: str = ""
 
 
 def build_for_variant(
@@ -76,49 +77,39 @@ def build_from_table(
     as_of: Optional[date] = None,
     item_class_by_order: Optional[Dict[str, str]] = None,
 ) -> KpiBuildResult:
+    """Enrich one site's harvest and upsert into dataset\\FPSO_*.csv only.
+
+    Per-site ``GIR_wo_fact.csv`` / ``CLV_kpi_summary.csv`` etc. are no longer written;
+    Power BI consumes the combined FPSO files.
+    """
     as_of = as_of or date.today()
     lookup = item_class_by_order or load_item_class_lookup(folder, variant)
     table = ensure_item_class_column(table, lookup)
-    # Persist the XLOOKUP values so a plain SAP re-harvest can restore col A.
+    # Persist Item Class into the FPSO master lookup (Site, Order, ItemClass).
     save_item_class_lookup(folder, variant, table)
+    site = _site_code(variant)
     rows = [
         _enrich_row(
             headers=table.headers,
             row=row,
             as_of=as_of,
             item_class_by_order=lookup,
+            site=site,
         )
         for row in table.rows
     ]
     if not rows:
         raise ExportError(f"{variant}: no rows to build KPIs from.")
 
-    dataset_dir = folder / "dataset"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    site = _site_code(variant)
-    fact_csv = dataset_dir / f"{site}_wo_fact.csv"
-    summary_csv = dataset_dir / f"{site}_kpi_summary.csv"
-    matrix_csv = dataset_dir / f"{site}_backlog_matrix.csv"
-    dashboard = folder / f"{site}_Inspection_Dashboard.xlsx"
-
-    _write_fact_csv(fact_csv, rows)
     completed = sum(1 for r in rows if r["IsCompleted"])
     backlog = sum(1 for r in rows if r["IsBacklog"])
     total = len(rows)
     perf = (completed / total) if total else 0.0
-    _write_summary_csv(
-        summary_csv,
-        variant=variant,
-        as_of=as_of,
-        total=total,
-        completed=completed,
-        backlog=backlog,
-        performance_pct=perf,
-    )
-    _write_matrix_csv(matrix_csv, rows)
-    _write_dashboard_xlsx(
-        dashboard,
-        rows,
+
+    fact_csv = upsert_fpso_site(
+        folder,
+        site=site,
+        rows=rows,
         variant=variant,
         as_of=as_of,
         total=total,
@@ -132,15 +123,16 @@ def build_from_table(
         total,
         perf * 100,
         backlog,
-        dashboard.name,
+        fact_csv.name,
     )
     return KpiBuildResult(
         fact_csv=fact_csv,
-        dashboard_xlsx=dashboard,
+        dashboard_xlsx=None,
         total_orders=total,
         completed=completed,
         performance_pct=perf,
         backlog=backlog,
+        site=site,
     )
 
 
@@ -198,6 +190,7 @@ def _enrich_row(
     row: Sequence[Any],
     as_of: date,
     item_class_by_order: Optional[Dict[str, str]] = None,
+    site: str = "",
 ) -> Dict[str, Any]:
     user_status = str(_val(headers, row, "UserStatus") or "")
     sys_status = str(_val(headers, row, "SysStatus") or "")
@@ -216,13 +209,24 @@ def _enrich_row(
     order = _val(headers, row, "Order")
     item_class = resolve_item_class(headers, row, order, item_class_by_order)
     sece = "SECE" if "SCE" in tokens else "NON SECE"
+    bsc_start = _as_date(_val(headers, row, "Bsc start"))
+    actual_end = _as_date(_val(headers, row, "Actual end"))
+    status_primary = _status_primary(tokens, user_status)
+    plan_month = bsc_start.strftime("%Y-%m") if bsc_start else ""
+    complete_month = actual_end.strftime("%Y-%m") if actual_end else ""
+    bucket_sort = next(
+        (i for i, (label, _, _) in enumerate(BACKLOG_BUCKETS) if label == bucket),
+        "",
+    )
     return {
+        "Site": site,
         "ItemClass": item_class,
         "WorkOrder": order,
         "Message": _val(headers, row, "Message"),
         "Description": desc,
         "UserStatus": user_status,
         "SysStatus": sys_status,
+        "StatusPrimary": status_primary,
         "FunctionalLocation": fl,
         "FunctionalLocationDesc": fl_desc,
         "DueDate": due.isoformat() if due else "",
@@ -231,12 +235,24 @@ def _enrich_row(
         "IsBacklog": is_backlog,
         "DaysOverdue": days_overdue if days_overdue is not None else "",
         "BacklogBucket": bucket,
+        "BucketSort": bucket_sort if bucket else "",
         "SECE": sece,
-        "BscStart": _iso(_val(headers, row, "Bsc start")),
-        "ActualEnd": _iso(_val(headers, row, "Actual end")),
+        "BscStart": bsc_start.isoformat() if bsc_start else "",
+        "ActualEnd": actual_end.isoformat() if actual_end else "",
+        "PlanMonth": plan_month,
+        "CompleteMonth": complete_month,
         "MnWkCtr": _val(headers, row, "Mn.wk.ctr"),
         "AsOf": as_of.isoformat(),
     }
+
+
+def _status_primary(tokens: set, user_status: str) -> str:
+    """Single status label for donut / status breakdown visuals."""
+    for code in ("QCAP", "EXDO", "APPR", "INIT", "SWE", "COMP", "TECO"):
+        if code in tokens:
+            return code
+    parts = [p for p in str(user_status or "").split() if p]
+    return parts[0] if parts else ""
 
 
 def resolve_item_class(
@@ -274,10 +290,17 @@ def _order_key(order: Any) -> str:
 
 
 def load_item_class_lookup(folder: Path, variant: str) -> Dict[str, str]:
-    """Load Order → Item Class from cache and any enriched workbooks on disk."""
+    """Load Order → Item Class from cache and any enriched workbooks on disk.
+
+    Sources (later wins on key clash — FPSO master is authoritative):
+      1. dataset\\{SITE}_item_class_lookup.csv  (runtime cache)
+      2. Newest enriched IW38_*_{variant}*.xlsx col A (XLOOKUP)
+      3. dataset\\FPSO_item_class_lookup.csv    (Site, Order, ItemClass) ← master
+    """
     mapping: Dict[str, str] = {}
     site = _site_code(variant)
-    cache = folder / "dataset" / f"{site}_item_class_lookup.csv"
+    dataset_dir = folder / "dataset"
+    cache = dataset_dir / f"{site}_item_class_lookup.csv"
     if cache.exists():
         mapping.update(_read_lookup_csv(cache))
     # Prefer the newest enriched workbook that already has col A = Item Class.
@@ -288,7 +311,8 @@ def load_item_class_lookup(folder: Path, variant: str) -> Dict[str, str]:
         reverse=True,
     )
     for path in candidates:
-        if path.name.startswith("CLV_Inspection"):
+        name = path.name.upper()
+        if "INSPECTION_DASHBOARD" in name or name.startswith("FPSO_"):
             continue
         try:
             extracted = _extract_item_class_map_from_xlsx(path)
@@ -303,37 +327,106 @@ def load_item_class_lookup(folder: Path, variant: str) -> Dict[str, str]:
                 path.name,
             )
             break
+    fpso = dataset_dir / "FPSO_item_class_lookup.csv"
+    if fpso.exists():
+        from_fpso = _read_lookup_csv(fpso, site=site)
+        if from_fpso:
+            mapping.update(from_fpso)
+            log.info(
+                "Applied %d Item Class value(s) for %s from master %s",
+                len(from_fpso),
+                site,
+                fpso.name,
+            )
     return mapping
 
 
 def save_item_class_lookup(folder: Path, variant: str, table: convert.Table) -> Path:
+    """Update master dataset\\FPSO_item_class_lookup.csv for this site (no per-site CSV)."""
     dataset_dir = folder / "dataset"
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    path = dataset_dir / f"{_site_code(variant)}_item_class_lookup.csv"
+    site = _site_code(variant)
     order_idx = _col(table.headers, "Order")
     class_idx = None
     for index, header in enumerate(table.headers):
         if str(header or "").strip().lower() in _ITEM_CLASS_HEADERS:
             class_idx = index
             break
+    path = dataset_dir / "FPSO_item_class_lookup.csv"
     if order_idx is None or class_idx is None:
         return path
-    rows: List[List[object]] = []
-    seen = set()
+    order_class: Dict[str, str] = {}
     for row in table.rows:
         key = _order_key(row[order_idx] if order_idx < len(row) else "")
         klass = str(row[class_idx] if class_idx < len(row) else "").strip()
-        if not key or not klass or key in seen:
+        if not key or not klass:
             continue
         if klass.upper().startswith("IFERROR") or "XLOOKUP" in klass.upper():
             continue
-        seen.add(key)
-        rows.append([key, klass])
+        order_class[key] = klass
+    if not order_class:
+        log.info(
+            "Keeping existing FPSO Item Class master (harvest had no values for %s)",
+            site,
+        )
+        return path
+    return sync_fpso_item_class_lookup(folder, site=site, order_class=order_class)
+
+
+def sync_fpso_item_class_lookup(
+    folder: Path,
+    *,
+    site: Optional[str] = None,
+    order_class: Optional[Dict[str, str]] = None,
+) -> Path:
+    """Merge/rewrite dataset\\FPSO_item_class_lookup.csv (Site, Order, ItemClass).
+
+    If ``site`` + ``order_class`` are given, replace that site's rows and keep others.
+    Otherwise rebuild from all per-site ``{SITE}_item_class_lookup.csv`` files.
+    """
+    dataset_dir = folder / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    path = dataset_dir / "FPSO_item_class_lookup.csv"
+    by_site: Dict[str, Dict[str, str]] = {}
+
+    if path.is_file():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                site_key = str(row.get("Site") or row.get("site") or "").strip().upper()
+                order = _order_key(row.get("Order") or row.get("order"))
+                klass = str(
+                    row.get("ItemClass") or row.get("Item Class") or ""
+                ).strip()
+                if not site_key or not order or not klass:
+                    continue
+                by_site.setdefault(site_key, {})[order] = klass
+
+    for site_code in ("GIR", "DAL", "PAZ", "CLV"):
+        # Legacy per-site caches (optional); FPSO master is authoritative.
+        cache = dataset_dir / f"{site_code}_item_class_lookup.csv"
+        if cache.is_file() and cache.stat().st_size > 0:
+            loaded = _read_lookup_csv(cache)
+            if loaded:
+                by_site[site_code] = loaded
+
+    if site and order_class is not None:
+        site_key = site.upper()
+        merged = dict(by_site.get(site_key) or {})
+        for order, klass in order_class.items():
+            key = _order_key(order)
+            text = str(klass or "").strip()
+            if key and text:
+                merged[key] = text
+        by_site[site_key] = merged
+
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Order", "ItemClass"])
-        writer.writerows(rows)
+        writer.writerow(["Site", "Order", "ItemClass"])
+        for site_key in ("GIR", "DAL", "PAZ", "CLV"):
+            for order, klass in sorted((by_site.get(site_key) or {}).items()):
+                writer.writerow([site_key, order, klass])
     return _replace_file(tmp, path)
 
 
@@ -366,6 +459,8 @@ def write_item_class_lookup_xlsx(
                 continue
             seen.add(key)
             rows.append([key, klass])
+    if not rows and path.is_file():
+        return path
     rows.sort(key=lambda item: str(item[0]))
     tmp = path.with_suffix(path.suffix + ".tmp")
     xlsx.write(
@@ -376,6 +471,23 @@ def write_item_class_lookup_xlsx(
         column_widths=(14, 28),
     )
     return _replace_file(tmp, path)
+
+def _read_lookup_csv(path: Path, site: Optional[str] = None) -> Dict[str, str]:
+    """Read Order→ItemClass; optional ``site`` filters FPSO-style Site,Order,ItemClass."""
+    mapping: Dict[str, str] = {}
+    want = site.upper() if site else None
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if want is not None:
+                row_site = str(row.get("Site") or row.get("site") or "").strip().upper()
+                if row_site and row_site != want:
+                    continue
+            key = _order_key(row.get("Order") or row.get("order"))
+            klass = str(row.get("ItemClass") or row.get("Item Class") or "").strip()
+            if key and klass:
+                mapping[key] = klass
+    return mapping
 
 
 def ensure_item_class_column(
@@ -434,18 +546,6 @@ def ensure_item_class_column(
         klass = clean_lookup.get(order, "")
         new_rows.append([klass, *values])
     return convert.Table(headers=new_headers, rows=new_rows)
-
-
-def _read_lookup_csv(path: Path) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            key = _order_key(row.get("Order") or row.get("order"))
-            klass = str(row.get("ItemClass") or row.get("Item Class") or "").strip()
-            if key and klass:
-                mapping[key] = klass
-    return mapping
 
 
 def _extract_item_class_map_from_xlsx(path: Path) -> Dict[str, str]:
@@ -585,23 +685,42 @@ def _write_summary_csv(
     completed: int,
     backlog: int,
     performance_pct: float,
+    site: str = "",
 ) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Metric", "Value", "Variant", "AsOf"])
-        writer.writerow(["Global Plan (WOs)", total, variant, as_of.isoformat()])
-        writer.writerow(["Perf (QCAP or EXDO)", completed, variant, as_of.isoformat()])
+        writer.writerow(["Metric", "Value", "Site", "Variant", "AsOf"])
         writer.writerow(
-            ["Performance %", round(performance_pct, 4), variant, as_of.isoformat()]
+            ["Global Plan (WOs)", total, site, variant, as_of.isoformat()]
         )
         writer.writerow(
-            ["Backlog (open & due+28 < today)", backlog, variant, as_of.isoformat()]
+            ["Perf (QCAP or EXDO)", completed, site, variant, as_of.isoformat()]
+        )
+        writer.writerow(
+            [
+                "Performance %",
+                round(performance_pct, 4),
+                site,
+                variant,
+                as_of.isoformat(),
+            ]
+        )
+        writer.writerow(
+            [
+                "Backlog (open & due+28 < today)",
+                backlog,
+                site,
+                variant,
+                as_of.isoformat(),
+            ]
         )
     _replace_file(tmp, path)
 
 
-def _write_matrix_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+def _write_matrix_csv(
+    path: Path, rows: List[Dict[str, Any]], site: str = ""
+) -> None:
     """Long-form matrix for Power BI matrix visual (Equipment Class × bucket × SECE)."""
     counts: Dict[Tuple[str, str, str], int] = defaultdict(int)
     for row in rows:
@@ -612,7 +731,7 @@ def _write_matrix_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["EquipmentClass", "BacklogBucket", "SECE", "WO_Count", "BucketSort"]
+            ["Site", "EquipmentClass", "BacklogBucket", "SECE", "WO_Count", "BucketSort"]
         )
         sort_map = {label: i for i, (label, _, _) in enumerate(BACKLOG_BUCKETS)}
         for (item_class, bucket, sece), count in sorted(
@@ -624,8 +743,297 @@ def _write_matrix_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             ),
         ):
             writer.writerow(
-                [item_class, bucket, sece, count, sort_map.get(bucket, 99)]
+                [site, item_class, bucket, sece, count, sort_map.get(bucket, 99)]
             )
+    _replace_file(tmp, path)
+
+
+def upsert_fpso_site(
+    folder: Path,
+    *,
+    site: str,
+    rows: List[Dict[str, Any]],
+    variant: str,
+    as_of: date,
+    total: int,
+    completed: int,
+    backlog: int,
+    performance_pct: float,
+) -> Path:
+    """Replace one Site's rows inside dataset\\FPSO_*.csv (Power BI inputs only)."""
+    dataset_dir = folder / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    site_key = site.upper()
+    fact_path = dataset_dir / "FPSO_wo_fact.csv"
+
+    existing = _load_fact_dicts(fact_path)
+    kept = [r for r in existing if str(r.get("Site") or "").upper() != site_key]
+    merged = kept + [_fact_row_as_dict(r) for r in rows]
+    if not merged:
+        raise ExportError("FPSO fact would be empty after upsert.")
+
+    fieldnames = list(merged[0].keys())
+    for row in merged[1:]:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    _write_rows_csv(fact_path, fieldnames, merged)
+
+    # Rebuild summary + matrix from the full combined fact (all sites).
+    _rewrite_fpso_summary_and_matrix(
+        dataset_dir,
+        merged,
+        touch_site=site_key,
+        touch_variant=variant,
+        touch_as_of=as_of,
+        touch_total=total,
+        touch_completed=completed,
+        touch_backlog=backlog,
+        touch_performance_pct=performance_pct,
+    )
+    log.info(
+        "FPSO dataset upsert %s: %d rows (fact total %d) → %s",
+        site_key,
+        len(rows),
+        len(merged),
+        fact_path.name,
+    )
+    return fact_path
+
+
+def write_combined_fpso_dataset(
+    folder: Path,
+    sites: Sequence[str] = ("GIR", "DAL", "PAZ", "CLV"),
+) -> Dict[str, Path]:
+    """Ensure FPSO_* Power BI files exist; rebuild from harvest workbooks if needed.
+
+    Prefer the in-run ``upsert_fpso_site`` path. This is a safety net for
+    ``iw38-kpi`` / end-of-harvest when facts were just upserted, or a full
+    rebuild from ``IW38_*_{SITE}-PG2026.xlsx`` when FPSO_wo_fact.csv is missing.
+    """
+    dataset_dir = folder / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    fact_out = dataset_dir / "FPSO_wo_fact.csv"
+    summary_out = dataset_dir / "FPSO_kpi_summary.csv"
+    matrix_out = dataset_dir / "FPSO_backlog_matrix.csv"
+
+    if fact_out.is_file() and fact_out.stat().st_size > 0:
+        rows = _load_fact_dicts(fact_out)
+        if rows:
+            _rewrite_fpso_summary_and_matrix(dataset_dir, rows)
+            log.info(
+                "FPSO dataset ready: %d rows → %s",
+                len(rows),
+                fact_out.name,
+            )
+            return {"fact": fact_out, "summary": summary_out, "matrix": matrix_out}
+
+    # Cold start: rebuild each site from the latest harvest workbook.
+    for site in sites:
+        variant = f"{site}-PG2026"
+        harvest = folder / f"IW38_FR3_{variant}.xlsx"
+        if not harvest.exists():
+            # Try any system code in the filename.
+            matches = sorted(folder.glob(f"IW38_*_{variant}.xlsx"))
+            harvest = matches[0] if matches else harvest
+        if not harvest.exists():
+            continue
+        try:
+            table = convert.read_xlsx(harvest)
+            build_from_table(table, folder, variant)
+        except Exception as exc:
+            log.warning("Could not rebuild %s from %s: %s", site, harvest.name, exc)
+
+    if not fact_out.is_file():
+        raise ExportError(
+            "No FPSO dataset CSVs found. Run `python -m iw29_export iw38` first."
+        )
+    return {
+        "fact": fact_out,
+        "summary": summary_out,
+        "matrix": matrix_out,
+    }
+
+
+def _fact_row_as_dict(row: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for key, value in row.items():
+        if isinstance(value, bool):
+            out[key] = "True" if value else "False"
+        elif value is None:
+            out[key] = ""
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _load_fact_dicts(path: Path) -> List[Dict[str, str]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return []
+        return [{key: (row.get(key) or "") for key in reader.fieldnames} for row in reader]
+
+
+def _rewrite_fpso_summary_and_matrix(
+    dataset_dir: Path,
+    fact_rows: Sequence[Dict[str, str]],
+    *,
+    touch_site: str = "",
+    touch_variant: str = "",
+    touch_as_of: Optional[date] = None,
+    touch_total: int = 0,
+    touch_completed: int = 0,
+    touch_backlog: int = 0,
+    touch_performance_pct: float = 0.0,
+) -> None:
+    """Rewrite FPSO_kpi_summary.csv + FPSO_backlog_matrix.csv from fact rows."""
+    summary_path = dataset_dir / "FPSO_kpi_summary.csv"
+    # Preserve prior summary rows for sites not in this fact snapshot when possible.
+    prior: Dict[str, Dict[str, str]] = {}
+    if summary_path.is_file():
+        with summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                site = str(row.get("Site") or "").upper()
+                metric = str(row.get("Metric") or "")
+                if site and metric:
+                    prior[f"{site}|{metric}"] = dict(row)
+
+    # Compute per-site totals from fact.
+    by_site: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in fact_rows:
+        site = str(row.get("Site") or "").upper()
+        if site:
+            by_site[site].append(row)
+
+    summary_rows: List[Dict[str, str]] = []
+    for site, rows in by_site.items():
+        if site == touch_site.upper() and touch_variant:
+            total = touch_total
+            completed = touch_completed
+            backlog = touch_backlog
+            perf = touch_performance_pct
+            as_of = (touch_as_of or date.today()).isoformat()
+            variant = touch_variant
+        else:
+            total = len(rows)
+            completed = sum(1 for r in rows if _truthy(r.get("IsCompleted")))
+            backlog = sum(1 for r in rows if _truthy(r.get("IsBacklog")))
+            perf = (completed / total) if total else 0.0
+            as_of = next((r.get("AsOf") or "" for r in rows if r.get("AsOf")), "")
+            variant = prior.get(f"{site}|Global Plan (WOs)", {}).get("Variant") or f"{site}-PG2026"
+        for metric, value in (
+            ("Global Plan (WOs)", total),
+            ("Perf (QCAP or EXDO)", completed),
+            ("Performance %", round(perf, 4)),
+            ("Backlog (open & due+28 < today)", backlog),
+        ):
+            summary_rows.append(
+                {
+                    "Metric": metric,
+                    "Value": str(value),
+                    "Site": site,
+                    "Variant": variant,
+                    "AsOf": as_of,
+                }
+            )
+
+    if summary_rows:
+        _write_rows_csv(
+            summary_path,
+            ["Metric", "Value", "Site", "Variant", "AsOf"],
+            summary_rows,
+        )
+
+    # Matrix from backlog rows across all sites.
+    matrix_path = dataset_dir / "FPSO_backlog_matrix.csv"
+    counts: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
+    for row in fact_rows:
+        if not _truthy(row.get("IsBacklog")):
+            continue
+        site = str(row.get("Site") or "").upper()
+        counts[
+            (
+                site,
+                str(row.get("ItemClass") or ""),
+                str(row.get("BacklogBucket") or ""),
+                str(row.get("SECE") or ""),
+            )
+        ] += 1
+    sort_map = {label: i for i, (label, _, _) in enumerate(BACKLOG_BUCKETS)}
+    matrix_rows: List[Dict[str, str]] = []
+    for (site, item_class, bucket, sece), count in sorted(
+        counts.items(),
+        key=lambda item: (
+            item[0][0],
+            item[0][1],
+            sort_map.get(item[0][2], 99),
+            item[0][3],
+        ),
+    ):
+        matrix_rows.append(
+            {
+                "Site": site,
+                "EquipmentClass": item_class,
+                "BacklogBucket": bucket,
+                "SECE": sece,
+                "WO_Count": str(count),
+                "BucketSort": str(sort_map.get(bucket, 99)),
+            }
+        )
+    _write_rows_csv(
+        matrix_path,
+        ["Site", "EquipmentClass", "BacklogBucket", "SECE", "WO_Count", "BucketSort"],
+        matrix_rows,
+    )
+
+
+def _truthy(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y"}
+
+
+def _read_csv_rows_with_site(
+    paths: Sequence[Path],
+    *,
+    site_hint_from_name: bool = False,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    rows: List[Dict[str, str]] = []
+    fieldnames: List[str] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        site_guess = ""
+        if site_hint_from_name:
+            site_guess = path.name.split("_", 1)[0].upper()
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                continue
+            for name in reader.fieldnames:
+                if name not in fieldnames:
+                    fieldnames.append(name)
+            if "Site" not in fieldnames:
+                fieldnames.insert(0, "Site")
+            for raw in reader:
+                row = {key: (raw.get(key) or "") for key in fieldnames}
+                if not str(row.get("Site") or "").strip():
+                    row["Site"] = site_guess
+                rows.append(row)
+    return rows, fieldnames
+
+
+def _write_rows_csv(
+    path: Path, fieldnames: Sequence[str], rows: Sequence[Dict[str, str]]
+) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
     _replace_file(tmp, path)
 
 

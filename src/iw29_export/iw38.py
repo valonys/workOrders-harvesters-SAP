@@ -125,6 +125,18 @@ def run(
     summary = Iw38HarvestResult(
         started_at=started, finished_at=finished, results=results
     )
+    if cfg.build_kpi and summary.saved:
+        try:
+            from . import iw38_kpi
+
+            combined = iw38_kpi.write_combined_fpso_dataset(out_dir)
+            fact = combined.get("fact")
+            emit(
+                f"Combined FPSO dataset ready"
+                + (f" → {fact.name}" if fact else "")
+            )
+        except Exception as exc:
+            log.warning("Could not build combined FPSO dataset: %s", exc)
     emit(
         f"Done: {summary.saved} saved, {summary.failed} failed in "
         f"{(finished - started).total_seconds():.1f}s"
@@ -204,7 +216,6 @@ def _harvest_variant(
     if cfg.build_kpi:
         enriched = iw38_kpi.ensure_item_class_column(table, lookup)
         iw38_kpi.save_item_class_lookup(out_dir, variant, enriched)
-        iw38_kpi.write_item_class_lookup_xlsx(out_dir, variant, enriched)
 
     with tempfile.TemporaryDirectory(prefix="iw38-build-", dir=str(staging)) as scratch:
         built = Path(scratch) / filename
@@ -234,7 +245,7 @@ def _harvest_variant(
                 f"KPI {variant}: performance {kpi.performance_pct:.1%} "
                 f"({kpi.completed}/{kpi.total_orders}), backlog {kpi.backlog}, "
                 f"Item Class filled {with_class}/{enriched.row_count} "
-                f"→ {kpi.dashboard_xlsx.name}"
+                f"→ {kpi.fact_csv.name}"
             )
         except Exception as exc:
             log.exception("KPI build failed for %s", variant)

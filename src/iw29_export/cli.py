@@ -57,7 +57,10 @@ examples:
   iw29-export iw22-merge-pdfs --batch GIR
   iw29-export iw22-lookup                rebuild GIR/DAL/PAZ/CLV lookup + Scenario
   iw29-export iw38                       download configured IW38/IW39 variants
+  iw29-export iw38 --variants CLV-PG2026 CLV-only harvest + KPI dataset refresh
+  iw29-export iw38                       harvest GIR+DAL+PAZ+CLV + FPSO_wo_fact.csv
   iw29-export iw38-kpi                   rebuild CLV Performance/Backlog smoke KPIs
+  iw29-export iw38-kpi --variants GIR-PG2026 DAL-PG2026 PAZ-PG2026 CLV-PG2026
   iw29-export archive --dry-run          show what housekeeping would do
 """
 
@@ -107,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         dest="batches",
         help="iw22-attachments only: run one FPSO batch (repeatable: GIR, DAL, PAZ, CLV)",
+    )
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        dest="iw38_variants",
+        help="iw38 / iw38-kpi only: limit to these variants (e.g. CLV-PG2026)",
     )
     return parser
 
@@ -328,13 +337,15 @@ def _command_iw22_lookup(config: Config, args: argparse.Namespace) -> int:
 
 
 def _command_iw38(config: Config, args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
     from . import iw38
 
-    del args
     if not config.iw38.enabled:
-        from dataclasses import replace
-
         config = replace(config, iw38=replace(config.iw38, enabled=True))
+    variants = getattr(args, "iw38_variants", None)
+    if variants:
+        config = replace(config, iw38=replace(config.iw38, variants=list(variants)))
     result = iw38.run(config)
     print(f"IW38: {result.saved} saved, {result.failed} failed")
     for item in result.results:
@@ -347,8 +358,9 @@ def _command_iw38(config: Config, args: argparse.Namespace) -> int:
 def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
     from . import iw38_kpi
 
-    del args
-    variants = config.iw38.variants or ["CLV-PG2026"]
+    variants = getattr(args, "iw38_variants", None) or config.iw38.variants or [
+        "CLV-PG2026"
+    ]
     exit_code = 0
     for variant in variants:
         try:
@@ -363,7 +375,15 @@ def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
             f"backlog {result.backlog}"
         )
         print(f"  fact: {result.fact_csv}")
-        print(f"  dashboard: {result.dashboard_xlsx}")
+    if exit_code == 0 or len(variants) > 1:
+        try:
+            folder = config.iw38.folder or Path.home() / "IW38"
+            combined = iw38_kpi.write_combined_fpso_dataset(folder)
+            fact = combined.get("fact")
+            if fact:
+                print(f"Combined FPSO fact: {fact}")
+        except Exception as exc:
+            print(f"Combined FPSO dataset skipped: {exc}", file=sys.stderr)
     return exit_code
 
 

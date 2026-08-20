@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional, Tuple
@@ -27,6 +27,16 @@ _LEVEL_COLOURS = {
     "ERROR": "#b42318",
     "CRITICAL": "#b42318",
 }
+
+
+@dataclass
+class _Iw38GuiResult:
+    """Minimal stand-in so the shared _finish() path can open the FPSO folder."""
+
+    workbook: Optional[Path]
+    row_count: int
+    duration_s: float
+    warnings: List[str]
 
 
 class App(ttk.Frame):
@@ -77,11 +87,11 @@ class App(ttk.Frame):
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header.columnconfigure(0, weight=1)
         ttk.Label(
-            header, text="SAP IW29 export", font=("Segoe UI Semibold", 15)
+            header, text="SAP IW29 / IW38", font=("Segoe UI Semibold", 15)
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="Runs the notification list and drops a workbook into the synced folder.",
+            text="IW29 export, or force Update IW38 FPSO (GIR/DAL/PAZ/CLV → FPSO_wo_fact.csv).",
             foreground="#5b6472",
         ).grid(row=1, column=0, sticky="w")
         ttk.Label(header, text=f"v{__version__}", foreground="#8b95a1").grid(
@@ -188,10 +198,14 @@ class App(ttk.Frame):
             buttons, text="Open folder", command=self._open_folder, state="disabled"
         )
         self.button_open.grid(row=0, column=1, padx=(0, 8))
-        self.button_run = ttk.Button(
-            buttons, text="Run export", command=self._on_run, style="Accent.TButton"
+        self.button_iw38 = ttk.Button(
+            buttons, text="Update IW38 FPSO", command=self._on_iw38
         )
-        self.button_run.grid(row=0, column=2)
+        self.button_iw38.grid(row=0, column=2, padx=(0, 8))
+        self.button_run = ttk.Button(
+            buttons, text="Run IW29 export", command=self._on_run, style="Accent.TButton"
+        )
+        self.button_run.grid(row=0, column=3)
         return frame
 
     # ------------------------------------------------------------------ actions
@@ -227,7 +241,7 @@ class App(ttk.Frame):
             return
 
         self._set_busy(True)
-        self.var_status.set("Running...")
+        self.var_status.set("Running IW29...")
         self._append("INFO", "-" * 60)
         self.log_handler = logging_setup.add_callback_handler(
             lambda level, text: self.messages.put((level, text)),
@@ -240,15 +254,76 @@ class App(ttk.Frame):
         self.worker = threading.Thread(target=work, name="iw29-run", daemon=True)
         self.worker.start()
 
+    def _on_iw38(self) -> None:
+        """Force GIR+DAL+PAZ+CLV harvest + FPSO_wo_fact.csv rebuild (no PBI open)."""
+        if self.worker is not None and self.worker.is_alive():
+            return
+        try:
+            config = self._config_from_form()
+        except Iw29Error as exc:
+            messagebox.showerror("Configuration problem", str(exc))
+            return
+
+        from . import iw38
+
+        if not config.iw38.enabled:
+            config = replace(config, iw38=replace(config.iw38, enabled=True))
+
+        self._set_busy(True)
+        self.var_status.set("Updating IW38 FPSO...")
+        self._append("INFO", "-" * 60)
+        self._append(
+            "INFO",
+            "Force IW38: GIR + DAL + PAZ + CLV → dataset\\FPSO_wo_fact.csv",
+        )
+        self.log_handler = logging_setup.add_callback_handler(
+            lambda level, text: self.messages.put((level, text)),
+            config.runtime.log_level,
+        )
+
+        def work() -> None:
+            try:
+                summary = iw38.run(config)
+                self.messages.put(
+                    (
+                        "INFO",
+                        f"IW38 done: {summary.saved} saved, {summary.failed} failed "
+                        f"in {(summary.finished_at - summary.started_at).total_seconds():.1f}s",
+                    )
+                )
+                folder = config.iw38.folder
+                fact = (folder / "dataset" / "FPSO_wo_fact.csv") if folder else None
+                self.results.put(
+                    (
+                        _Iw38GuiResult(
+                            workbook=fact if fact and fact.exists() else folder,
+                            row_count=summary.saved,
+                            duration_s=(
+                                summary.finished_at - summary.started_at
+                            ).total_seconds(),
+                            warnings=[],
+                        ),
+                        None,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - surface in UI
+                self.results.put((None, exc))
+
+        self.worker = threading.Thread(target=work, name="iw38-run", daemon=True)
+        self.worker.start()
+
     def _finish(self, result: Optional[pipeline.RunResult], error: Optional[Exception]) -> None:
         logging_setup.remove_handler(self.log_handler)
         self.log_handler = None
         self._set_busy(False)
         if result is not None:
-            self.last_output = result.workbook
-            self.button_open.configure(state="normal")
-            self.var_status.set(f"Done: {result.row_count:,} rows in {result.duration_s:.1f}s.")
-            for warning in result.warnings:
+            self.last_output = getattr(result, "workbook", None)
+            if self.last_output:
+                self.button_open.configure(state="normal")
+            rows = getattr(result, "row_count", 0)
+            dur = getattr(result, "duration_s", 0.0)
+            self.var_status.set(f"Done: {rows} site(s)/rows in {dur:.1f}s.")
+            for warning in getattr(result, "warnings", []) or []:
                 self._append("WARNING", warning)
         elif isinstance(error, EmptyResultError):
             self.var_status.set("No rows matched the selection.")
@@ -273,6 +348,7 @@ class App(ttk.Frame):
         state = "disabled" if busy else "normal"
         self.button_run.configure(state=state)
         self.button_check.configure(state=state)
+        self.button_iw38.configure(state=state)
         if busy:
             self.progress.start(12)
         else:
