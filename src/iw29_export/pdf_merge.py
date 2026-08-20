@@ -13,7 +13,10 @@ from .logging_setup import get_logger
 
 log = get_logger("pdf_merge")
 
-_PART_PDF = re.compile(r"^(\d+)\((\d+)\)\.pdf$", re.IGNORECASE)
+_PART_PDF = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]{0,120})\((\d+)\)\.pdf$",
+    re.IGNORECASE,
+)
 
 
 @dataclass

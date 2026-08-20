@@ -173,3 +173,16 @@ mock = false                 # true = generate sample data, never touch SAP
 log_folder = ""              # blank = <project>\logs
 log_level = "INFO"
 lock_timeout_s = 0           # >0 waits for a concurrent run, 0 fails fast
+
+# Fame+ tag harvest from a SharePoint site (Microsoft Graph).
+[sharepoint_attachments]
+enabled = false
+site_url = "https://totalworkplace.sharepoint.com/sites/TEPAO-B17-FO_STP"
+list_path = ""               # e.g. ...\Fame+\GIR_Fame+Tags.txt
+output_folder = ""           # blank = ...\Fame+\sp_attachments
+tenant_id = ""               # blank = organizations; TE tenant if known
+client_id = ""               # blank = Microsoft Graph CLI public client
+max_results_per_tag = 50
+merge_pdfs = true
+merge_keep_parts = false
+limit = 0

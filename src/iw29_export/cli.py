@@ -26,6 +26,7 @@ COMMANDS = (
     "iw22-lookup",
     "iw38",
     "iw38-kpi",
+    "sp-attachments",
     "archive",
     "gui",
     "store-password",
@@ -43,6 +44,7 @@ commands:
   iw22-lookup         rebuild per-FPSO Excel lists with Scenario summaries
   iw38                harvest IW39 order lists for the configured PG2026 variants
   iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
+  sp-attachments      search SharePoint for Fame+ tags and harvest/merge documents
   archive             only file away old reports
   gui                 open the desktop app
   store-password      save the SAP password in Windows Credential Manager
@@ -61,6 +63,7 @@ examples:
   iw29-export iw38                       harvest GIR+DAL+PAZ+CLV + FPSO_wo_fact.csv
   iw29-export iw38-kpi                   rebuild CLV Performance/Backlog smoke KPIs
   iw29-export iw38-kpi --variants GIR-PG2026 DAL-PG2026 PAZ-PG2026 CLV-PG2026
+  iw29-export sp-attachments --tags EC511B EC830 DA973
   iw29-export archive --dry-run          show what housekeeping would do
 """
 
@@ -117,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="iw38_variants",
         help="iw38 / iw38-kpi only: limit to these variants (e.g. CLV-PG2026)",
     )
+    parser.add_argument(
+        "--tags",
+        nargs="+",
+        dest="sp_tags",
+        help="sp-attachments only: harvest these Fame+/equipment tags",
+    )
     return parser
 
 
@@ -145,6 +154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "iw22-lookup": _command_iw22_lookup,
         "iw38": _command_iw38,
         "iw38-kpi": _command_iw38_kpi,
+        "sp-attachments": _command_sp_attachments,
         "archive": _command_archive,
         "gui": _command_gui,
         "store-password": _command_store_password,
@@ -385,6 +395,35 @@ def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"Combined FPSO dataset skipped: {exc}", file=sys.stderr)
     return exit_code
+
+
+def _command_sp_attachments(config: Config, args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
+    from . import sp_attachments
+
+    if not config.sharepoint_attachments.enabled:
+        config = replace(
+            config,
+            sharepoint_attachments=replace(
+                config.sharepoint_attachments, enabled=True
+            ),
+        )
+    tags = getattr(args, "sp_tags", None)
+    result = sp_attachments.run(config, tags=tags)
+    print(
+        f"SharePoint attachments: {result.saved} saved, "
+        f"{result.skipped} skipped, {result.failed} failed"
+    )
+    for item in result.results:
+        where = ""
+        if item.files:
+            where = " -> " + ", ".join(path.name for path in item.files[:5])
+            if len(item.files) > 5:
+                where += f" (+{len(item.files) - 5} more)"
+        detail = f" ({item.detail})" if item.detail else ""
+        print(f"  [{item.status}] {item.tag}{where}{detail}")
+    return 1 if result.failed and result.saved == 0 else 0
 
 
 def _command_archive(config: Config, args: argparse.Namespace) -> int:

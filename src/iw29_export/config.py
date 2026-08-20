@@ -258,6 +258,22 @@ class Iw38Config:
 
 
 @dataclass
+class SharePointAttachmentsConfig:
+    """Search a SharePoint site for Fame+/equipment tags and harvest documents."""
+
+    enabled: bool = False
+    site_url: str = ""
+    list_path: Optional[Path] = None
+    output_folder: Optional[Path] = None
+    tenant_id: str = ""  # blank = "organizations"
+    client_id: str = ""  # blank = Microsoft Graph CLI public client
+    max_results_per_tag: int = 50
+    merge_pdfs: bool = True
+    merge_keep_parts: bool = False
+    limit: int = 0
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -279,6 +295,9 @@ class Config:
         default_factory=Iw22AttachmentsConfig
     )
     iw38: Iw38Config = field(default_factory=Iw38Config)
+    sharepoint_attachments: SharePointAttachmentsConfig = field(
+        default_factory=SharePointAttachmentsConfig
+    )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
 
@@ -327,6 +346,9 @@ class Config:
                 _section(data, "iw22_attachments", path)
             ),
             iw38=_build_iw38(_section(data, "iw38", path)),
+            sharepoint_attachments=_build_sharepoint_attachments(
+                _section(data, "sharepoint_attachments", path)
+            ),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
         )
@@ -413,6 +435,11 @@ class Config:
                 raise ConfigError(
                     f"iw38.mode must be one of {VALID_EXPORT_MODES}, "
                     f"got '{self.iw38.mode}'."
+                )
+        if self.sharepoint_attachments.enabled:
+            if not self.sharepoint_attachments.site_url.strip():
+                raise ConfigError(
+                    "sharepoint_attachments.site_url must be set when enabled."
                 )
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
@@ -640,6 +667,27 @@ def _build_iw38(raw: Dict[str, Any]) -> Iw38Config:
         mode=_str(raw, "iw38.mode", "text_then_convert").strip().lower(),
         build_kpi=_bool(raw, "iw38.build_kpi", True),
         checkboxes=checkboxes,
+    )
+
+
+def _build_sharepoint_attachments(raw: Dict[str, Any]) -> SharePointAttachmentsConfig:
+    list_path = _str(raw, "sharepoint_attachments.list_path", "").strip()
+    output = _str(raw, "sharepoint_attachments.output_folder", "").strip()
+    return SharePointAttachmentsConfig(
+        enabled=_bool(raw, "sharepoint_attachments.enabled", False),
+        site_url=_str(raw, "sharepoint_attachments.site_url", "").strip(),
+        list_path=Path(list_path).expanduser() if list_path else None,
+        output_folder=Path(output).expanduser() if output else None,
+        tenant_id=_str(raw, "sharepoint_attachments.tenant_id", "").strip(),
+        client_id=_str(raw, "sharepoint_attachments.client_id", "").strip(),
+        max_results_per_tag=_int(
+            raw, "sharepoint_attachments.max_results_per_tag", 50
+        ),
+        merge_pdfs=_bool(raw, "sharepoint_attachments.merge_pdfs", True),
+        merge_keep_parts=_bool(
+            raw, "sharepoint_attachments.merge_keep_parts", False
+        ),
+        limit=_int(raw, "sharepoint_attachments.limit", 0),
     )
 
 
