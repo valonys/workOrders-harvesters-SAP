@@ -73,5 +73,6 @@ foreach ($t in $fpsoTasks) {
 
 Write-Host ""
 Write-Host "Pipeline: IW39 GIR+DAL+PAZ+CLV -> dataset\FPSO_wo_fact.csv (+ summary/matrix)"
-Write-Host "Power BI: one report on FPSO_wo_fact.csv with a Site slicer (GIR/DAL/PAZ/CLV)."
-Write-Host "Publish to Service for consumer refresh. Requires interactive logon (SAP GUI)."
+Write-Host "Power BI: refresh FPSO_Inspection.pbix from FPSO_wo_fact.csv, then publish/replace."
+Write-Host "Set [powerbi].workspace in config.toml if REST overwrite should target a named workspace."
+Write-Host "Requires interactive logon (SAP GUI + Power BI Desktop)."

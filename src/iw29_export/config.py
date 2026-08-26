@@ -274,6 +274,21 @@ class SharePointAttachmentsConfig:
 
 
 @dataclass
+class PowerBiConfig:
+    """After IW38 harvest, refresh the local PBIX and publish to the workspace."""
+
+    # Workspace consumers already use. Blank = last workspace chosen in Desktop.
+    workspace: str = ""
+    fpso_report: str = "FPSO_Inspection"
+    clv_report: str = "CLV_Inspection"
+    publish: bool = True
+    close_after: bool = True
+    open_timeout_s: int = 180
+    refresh_timeout_s: int = 600
+    publish_timeout_s: int = 180
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -298,6 +313,7 @@ class Config:
     sharepoint_attachments: SharePointAttachmentsConfig = field(
         default_factory=SharePointAttachmentsConfig
     )
+    powerbi: PowerBiConfig = field(default_factory=PowerBiConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
 
@@ -349,6 +365,7 @@ class Config:
             sharepoint_attachments=_build_sharepoint_attachments(
                 _section(data, "sharepoint_attachments", path)
             ),
+            powerbi=_build_powerbi(_section(data, "powerbi", path)),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
         )
@@ -441,6 +458,10 @@ class Config:
                 raise ConfigError(
                     "sharepoint_attachments.site_url must be set when enabled."
                 )
+        if self.powerbi.open_timeout_s <= 0 or self.powerbi.refresh_timeout_s <= 0:
+            raise ConfigError("powerbi timeouts must be positive.")
+        if self.powerbi.publish_timeout_s <= 0:
+            raise ConfigError("powerbi.publish_timeout_s must be positive.")
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
         if not str(self.export.folder).strip():
@@ -750,6 +771,21 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
         ),
         fill_scenario=_bool(raw, "iw22_attachments.fill_scenario", True),
         scenario_max_pages=_int(raw, "iw22_attachments.scenario_max_pages", 6),
+    )
+
+
+def _build_powerbi(raw: Dict[str, Any]) -> PowerBiConfig:
+    return PowerBiConfig(
+        workspace=_str(raw, "powerbi.workspace", "").strip(),
+        fpso_report=_str(raw, "powerbi.fpso_report", "FPSO_Inspection").strip()
+        or "FPSO_Inspection",
+        clv_report=_str(raw, "powerbi.clv_report", "CLV_Inspection").strip()
+        or "CLV_Inspection",
+        publish=_bool(raw, "powerbi.publish", True),
+        close_after=_bool(raw, "powerbi.close_after", True),
+        open_timeout_s=_int(raw, "powerbi.open_timeout_s", 180),
+        refresh_timeout_s=_int(raw, "powerbi.refresh_timeout_s", 600),
+        publish_timeout_s=_int(raw, "powerbi.publish_timeout_s", 180),
     )
 
 

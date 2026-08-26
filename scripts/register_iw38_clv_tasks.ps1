@@ -57,6 +57,5 @@ foreach ($t in $tasks) {
 }
 
 Write-Host ""
-Write-Host "Pipeline: IW39 CLV-PG2026 harvest -> dataset\CLV_*.csv -> open PBIX for Refresh."
-Write-Host "For unattended Power BI updates, publish the PBIX to Power BI Service and schedule refresh there."
-Write-Host "Requires interactive logon (SAP GUI Scripting)."
+Write-Host "Pipeline: IW39 CLV-PG2026 harvest -> dataset CSVs -> refresh PBIX and publish/replace."
+Write-Host "Set [powerbi].workspace in config.toml for a named workspace. Requires interactive logon."

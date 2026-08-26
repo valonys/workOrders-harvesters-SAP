@@ -1,49 +1,89 @@
 <#
 .SYNOPSIS
-    Open the combined FPSO Inspection Power BI report after dataset CSVs update.
+    Refresh FPSO_Inspection.pbix from FPSO_wo_fact.csv and publish/replace
+    the workspace report so consumers see the new IW38 harvest.
 
 .DESCRIPTION
-    Ensures FPSO_Inspection.pbix exists under IW38\dataset\ (seeded from the CLV
-    template on first run). Opens Desktop so you can click Refresh.
-    For unattended consumer updates: publish to Power BI Service and schedule refresh.
+    Power BI Desktop has no supported COM refresh/publish API. This script:
+      1. Closes a leftover Desktop session so harvest can overwrite the CSVs
+         (use -UnlockDataset from the pipeline, before IW38).
+      2. Opens the stable PBIX under IW38\dataset\
+      3. Refreshes the model (local Analysis Services, else Home > Refresh)
+      4. Saves, then publishes: REST overwrite if a token is available, else
+         Desktop Publish with Select / Replace / Got it clicked automatically
 
 .EXAMPLE
     .\refresh_fpso_powerbi.ps1
-    .\refresh_fpso_powerbi.ps1 -SkipOpen
+    .\refresh_fpso_powerbi.ps1 -UnlockDataset
+    .\refresh_fpso_powerbi.ps1 -SkipPublish
 #>
 [CmdletBinding()]
 param(
     [switch]$OpenOnly,
-    [switch]$SkipOpen
+    [switch]$SkipOpen,
+    [switch]$SkipRefresh,
+    [switch]$SkipPublish,
+    [switch]$LeaveOpen,
+    [switch]$UnlockDataset,
+    [string]$WorkspaceName = ""
 )
 
 $ErrorActionPreference = "Stop"
 
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    $extra = @()
+    foreach ($key in $PSBoundParameters.Keys) {
+        $val = $PSBoundParameters[$key]
+        if ($val -is [System.Management.Automation.SwitchParameter]) {
+            if ($val.IsPresent) { $extra += "-$key" }
+        } else {
+            $extra += "-$key"
+            $extra += [string]$val
+        }
+    }
+    $p = Start-Process -FilePath "powershell.exe" -ArgumentList (
+        @('-STA', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) + $extra
+    ) -Wait -PassThru -NoNewWindow
+    exit $p.ExitCode
+}
+
+. (Join-Path $PSScriptRoot "pbi_automate.ps1")
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$cfg = Get-PbiPipelineConfig -RepoRoot $repoRoot
+$reportName = $cfg.FpsoReport
+if (-not $WorkspaceName) { $WorkspaceName = [string]$cfg.Workspace }
+
 $iw38 = Join-Path $env:USERPROFILE "OneDrive - TotalEnergies\IW38"
 $dataset = Join-Path $iw38 "dataset"
-$stablePbix = Join-Path $dataset "FPSO_Inspection.pbix"
+$stablePbix = Join-Path $dataset "$reportName.pbix"
 $clvPbix = Join-Path $dataset "CLV_Inspection.pbix"
-$downloadsPbix = Join-Path $env:USERPROFILE "Downloads\FPSO_Inspection.pbix"
+$downloadsPbix = Join-Path $env:USERPROFILE "Downloads\$reportName.pbix"
 $stamp = Join-Path $dataset "FPSO_powerbi_last_refresh_attempt.txt"
 
-if (-not (Test-Path $dataset)) {
+if ($UnlockDataset) {
+    Close-PbiReport -ReportName $reportName
+    Write-Host "Dataset unlocked for harvest (Desktop closed for $reportName)."
+    exit 0
+}
+
+if (-not (Test-Path -LiteralPath $dataset)) {
     throw "Dataset folder missing: $dataset"
 }
 
-# Prefer Downloads draft, else seed from CLV template if FPSO pbix missing.
-if (Test-Path $downloadsPbix) {
-    if (-not (Test-Path $stablePbix) -or
-        ((Get-Item $downloadsPbix).LastWriteTime -gt (Get-Item $stablePbix).LastWriteTime)) {
+if (Test-Path -LiteralPath $downloadsPbix) {
+    if (-not (Test-Path -LiteralPath $stablePbix) -or
+        ((Get-Item -LiteralPath $downloadsPbix).LastWriteTime -gt (Get-Item -LiteralPath $stablePbix).LastWriteTime)) {
         Copy-Item -LiteralPath $downloadsPbix -Destination $stablePbix -Force
         Write-Host "Updated stable PBIX from $downloadsPbix"
     }
-} elseif (-not (Test-Path $stablePbix)) {
-    if (Test-Path $clvPbix) {
+} elseif (-not (Test-Path -LiteralPath $stablePbix)) {
+    if (Test-Path -LiteralPath $clvPbix) {
         Copy-Item -LiteralPath $clvPbix -Destination $stablePbix -Force
-        Write-Host "Seeded FPSO_Inspection.pbix from CLV template -> $stablePbix"
-        Write-Host "Next: point the fact table at FPSO_wo_fact.csv and add a Site slicer."
+        Write-Host "Seeded $reportName.pbix from CLV template -> $stablePbix"
+        Write-Host "Point the fact table at FPSO_wo_fact.csv and add a Site slicer if this is the first run."
     } else {
-        throw "No FPSO_Inspection.pbix or CLV_Inspection.pbix found under $dataset"
+        throw "No $reportName.pbix or CLV_Inspection.pbix found under $dataset"
     }
 }
 
@@ -51,7 +91,8 @@ if (Test-Path $downloadsPbix) {
     "attempted_utc=$((Get-Date).ToUniversalTime().ToString('o'))"
     "pbix=$stablePbix"
     "fact=$(Join-Path $dataset 'FPSO_wo_fact.csv')"
-    "note=Use FPSO_wo_fact.csv as the single fact; Site slicer filters GIR/DAL/PAZ/CLV."
+    "workspace=$WorkspaceName"
+    "note=Refresh FPSO_wo_fact.csv into the PBIX, then publish/replace on the workspace."
 ) | Set-Content -LiteralPath $stamp -Encoding UTF8
 
 Write-Host "CSV sources ready under $dataset"
@@ -64,20 +105,22 @@ if ($SkipOpen) {
     exit 0
 }
 
-$pbi = @(
-    "${env:ProgramFiles}\Microsoft Power BI Desktop\bin\PBIDesktop.exe",
-    "${env:ProgramFiles}\Microsoft Power BI Desktop\PBIDesktop.exe",
-    "${env:LOCALAPPDATA}\Microsoft\WindowsApps\PBIDesktopStore.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+$doPublish = $cfg.Publish -and -not $SkipPublish -and -not $OpenOnly
+$doRefresh = -not $SkipRefresh -and -not $OpenOnly
+$leave = $LeaveOpen -or $OpenOnly -or (-not $cfg.CloseAfter)
 
-if (-not $pbi) {
-    Write-Warning "Power BI Desktop not found. Open $stablePbix manually and click Refresh."
-    exit 0
+$params = @{
+    PbixPath         = $stablePbix
+    ReportName       = $reportName
+    WorkspaceName    = $WorkspaceName
+    OpenTimeoutS     = [int]$cfg.OpenTimeoutS
+    RefreshTimeoutS  = [int]$cfg.RefreshTimeoutS
+    PublishTimeoutS  = [int]$cfg.PublishTimeoutS
 }
+if (-not $doRefresh) { $params.SkipRefresh = $true }
+if (-not $doPublish) { $params.SkipPublish = $true }
+if ($leave) { $params.LeaveOpen = $true }
 
-Write-Host "Opening Power BI Desktop: $stablePbix"
-Start-Process -FilePath $pbi -ArgumentList "`"$stablePbix`""
-if (-not $OpenOnly) {
-    Write-Host "Click Home > Refresh after pointing source at FPSO_wo_fact.csv + Site slicer."
-}
+$result = @(Invoke-PbiRefreshAndPublish @params) | Select-Object -Last 1
+Write-Host ("Done. refreshed={0} published={1}" -f $result.Refreshed, $result.Published)
 exit 0

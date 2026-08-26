@@ -1,8 +1,9 @@
 @echo off
 rem End-to-end GIR+DAL+PAZ+CLV IW38 pipeline for Task Scheduler:
+rem   0) Close leftover Power BI Desktop so FPSO_wo_fact.csv can be overwritten
 rem   1) Harvest IW39 variants GIR/DAL/PAZ/CLV-PG2026
 rem   2) Upsert each site into dataset\FPSO_wo_fact.csv (+ summary/matrix)
-rem   3) Optionally open the FPSO Power BI report
+rem   3) Refresh FPSO_Inspection.pbix from those CSVs and publish/replace
 rem
 rem Usage:
 rem   run_iw38_fpso_pipeline.cmd
@@ -19,6 +20,11 @@ if exist "%ROOT%\.venv\Scripts\python.exe" (
     set "PY=python"
 )
 
+if "%REFRESH_PBI%"=="1" (
+    echo [%DATE% %TIME%] Closing Power BI Desktop so FPSO CSVs can be overwritten...
+    powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_fpso_powerbi.ps1" -UnlockDataset
+)
+
 echo [%DATE% %TIME%] IW38 FPSO harvest starting (GIR DAL PAZ CLV)...
 "%PY%" -m iw29_export iw38 --variants GIR-PG2026 DAL-PG2026 PAZ-PG2026 CLV-PG2026
 set "CODE=%ERRORLEVEL%"
@@ -30,10 +36,10 @@ if not "%CODE%"=="0" (
 
 echo [%DATE% %TIME%] IW38 FPSO dataset refreshed.
 if "%REFRESH_PBI%"=="1" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_fpso_powerbi.ps1"
+    powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_fpso_powerbi.ps1"
     set "PBI_CODE=%ERRORLEVEL%"
     if not "%PBI_CODE%"=="0" (
-        echo [%DATE% %TIME%] Power BI refresh returned %PBI_CODE% ^(CSV data is still updated^)
+        echo [%DATE% %TIME%] Power BI refresh/publish returned %PBI_CODE% ^(CSV data is still updated^)
     )
 )
 

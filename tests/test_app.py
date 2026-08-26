@@ -73,6 +73,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.sap.system, "FR3")
         self.assertEqual(config.selection.transaction, "IW29")
         self.assertTrue(any(f.field_name == "ARBPL" for f in config.selection.filters))
+        self.assertTrue(config.powerbi.publish)
+        self.assertEqual(config.powerbi.fpso_report, "FPSO_Inspection")
+
+    def test_powerbi_section_defaults_when_omitted(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            config = Config.load(_write_config(Path(scratch)))
+        self.assertEqual(config.powerbi.workspace, "")
+        self.assertTrue(config.powerbi.publish)
+        self.assertTrue(config.powerbi.close_after)
+        self.assertEqual(config.powerbi.clv_report, "CLV_Inspection")
 
     def test_dates_default_to_lookback_window(self):
         with tempfile.TemporaryDirectory() as scratch:
