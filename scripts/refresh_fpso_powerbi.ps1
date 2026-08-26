@@ -121,6 +121,13 @@ if (-not $doRefresh) { $params.SkipRefresh = $true }
 if (-not $doPublish) { $params.SkipPublish = $true }
 if ($leave) { $params.LeaveOpen = $true }
 
+$fpsoFact = Join-Path $dataset "FPSO_wo_fact.csv"
+$clvFact = Join-Path $dataset "CLV_wo_fact.csv"
+if (Test-Path -LiteralPath $fpsoFact) {
+    Copy-Item -LiteralPath $fpsoFact -Destination $clvFact -Force
+    Write-Host "Mirrored FPSO_wo_fact.csv -> CLV_wo_fact.csv (PBIX query name)."
+}
+
 $result = @(Invoke-PbiRefreshAndPublish @params) | Select-Object -Last 1
 Write-Host ("Done. refreshed={0} published={1}" -f $result.Refreshed, $result.Published)
 exit 0

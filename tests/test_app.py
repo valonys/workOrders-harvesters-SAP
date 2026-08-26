@@ -79,7 +79,7 @@ class ConfigTests(unittest.TestCase):
     def test_powerbi_section_defaults_when_omitted(self):
         with tempfile.TemporaryDirectory() as scratch:
             config = Config.load(_write_config(Path(scratch)))
-        self.assertEqual(config.powerbi.workspace, "")
+        self.assertEqual(config.powerbi.workspace, "My workspace")
         self.assertTrue(config.powerbi.publish)
         self.assertTrue(config.powerbi.close_after)
         self.assertEqual(config.powerbi.clv_report, "CLV_Inspection")

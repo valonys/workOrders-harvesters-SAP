@@ -16,6 +16,7 @@ Age buckets from days overdue after the +28 grace period.
 from __future__ import annotations
 
 import csv
+import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -826,6 +827,7 @@ def write_combined_fpso_dataset(
                 len(rows),
                 fact_out.name,
             )
+            _mirror_clv_wo_fact(dataset_dir, fact_out)
             return {"fact": fact_out, "summary": summary_out, "matrix": matrix_out}
 
     # Cold start: rebuild each site from the latest harvest workbook.
@@ -848,11 +850,24 @@ def write_combined_fpso_dataset(
         raise ExportError(
             "No FPSO dataset CSVs found. Run `python -m iw29_export iw38` first."
         )
+    _mirror_clv_wo_fact(dataset_dir, fact_out)
     return {
         "fact": fact_out,
         "summary": summary_out,
         "matrix": matrix_out,
     }
+
+
+def _mirror_clv_wo_fact(dataset_dir: Path, fact_out: Path) -> None:
+    """FPSO_Inspection.pbix still queries CLV_wo_fact — keep that file in sync."""
+    if not fact_out.is_file():
+        return
+    clv = dataset_dir / "CLV_wo_fact.csv"
+    try:
+        shutil.copyfile(fact_out, clv)
+        log.info("Mirrored %s → %s (PBIX query CLV_wo_fact)", fact_out.name, clv.name)
+    except OSError as exc:
+        log.warning("Could not mirror %s: %s", clv.name, exc)
 
 
 def _fact_row_as_dict(row: Dict[str, Any]) -> Dict[str, str]:

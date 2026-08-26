@@ -278,14 +278,14 @@ class PowerBiConfig:
     """After IW38 harvest, refresh the local PBIX and publish to the workspace."""
 
     # Workspace consumers already use. Blank = last workspace chosen in Desktop.
-    workspace: str = ""
+    workspace: str = "My workspace"
     fpso_report: str = "FPSO_Inspection"
     clv_report: str = "CLV_Inspection"
     publish: bool = True
     close_after: bool = True
     open_timeout_s: int = 180
     refresh_timeout_s: int = 600
-    publish_timeout_s: int = 180
+    publish_timeout_s: int = 360
 
 
 @dataclass
@@ -776,7 +776,8 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
 
 def _build_powerbi(raw: Dict[str, Any]) -> PowerBiConfig:
     return PowerBiConfig(
-        workspace=_str(raw, "powerbi.workspace", "").strip(),
+        workspace=_str(raw, "powerbi.workspace", "My workspace").strip()
+        or "My workspace",
         fpso_report=_str(raw, "powerbi.fpso_report", "FPSO_Inspection").strip()
         or "FPSO_Inspection",
         clv_report=_str(raw, "powerbi.clv_report", "CLV_Inspection").strip()
@@ -785,7 +786,7 @@ def _build_powerbi(raw: Dict[str, Any]) -> PowerBiConfig:
         close_after=_bool(raw, "powerbi.close_after", True),
         open_timeout_s=_int(raw, "powerbi.open_timeout_s", 180),
         refresh_timeout_s=_int(raw, "powerbi.refresh_timeout_s", 600),
-        publish_timeout_s=_int(raw, "powerbi.publish_timeout_s", 180),
+        publish_timeout_s=_int(raw, "powerbi.publish_timeout_s", 360),
     )
 
 

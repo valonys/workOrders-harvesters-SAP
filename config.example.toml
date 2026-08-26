@@ -168,19 +168,17 @@ build_kpi = true
 DY_MAB = true
 DY_HIS = true
 
-# After IW38 harvest, refresh FPSO_Inspection.pbix from dataset\FPSO_wo_fact.csv
-# and publish (replace) so workspace consumers see the new data. Desktop has no
-# supported COM API; the pipeline drives Refresh + the Replace/Got it dialogs.
-# workspace blank = last workspace chosen in Desktop Publish.
+# After IW38 harvest, refresh FPSO_Inspection.pbix and publish/replace
+# to My workspace (Select is disabled until that row is chosen).
 [powerbi]
-workspace = ""
+workspace = "My workspace"
 fpso_report = "FPSO_Inspection"
 clv_report = "CLV_Inspection"
 publish = true
-close_after = true           # close Desktop after publish so the next harvest can overwrite CSVs
+close_after = true
 open_timeout_s = 180
 refresh_timeout_s = 600
-publish_timeout_s = 180
+publish_timeout_s = 360
 
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP

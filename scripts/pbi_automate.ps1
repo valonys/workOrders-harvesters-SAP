@@ -57,7 +57,8 @@ function Get-PbiPipelineConfig {
         if ([int]::TryParse([string]$value, [ref]$parsed) -and $parsed -gt 0) { return $parsed }
         return [int]$default
     }
-    $workspace = [string](& $get $raw "workspace" "")
+    $workspace = [string](& $get $raw "workspace" "My workspace")
+    if (-not $workspace) { $workspace = "My workspace" }
     if ($env:PBI_WORKSPACE) { $workspace = $env:PBI_WORKSPACE }
     return [pscustomobject]@{
         Workspace         = $workspace
@@ -67,7 +68,7 @@ function Get-PbiPipelineConfig {
         CloseAfter        = & $asBool (& $get $raw "close_after" "true") $true
         OpenTimeoutS      = & $asInt (& $get $raw "open_timeout_s" 180) 180
         RefreshTimeoutS   = & $asInt (& $get $raw "refresh_timeout_s" 600) 600
-        PublishTimeoutS   = & $asInt (& $get $raw "publish_timeout_s" 180) 180
+        PublishTimeoutS   = & $asInt (& $get $raw "publish_timeout_s" 360) 360
     }
 }
 
@@ -208,6 +209,47 @@ function Find-UiaByName {
         }
     }
     return $null
+}
+
+function Set-UiaEditValue {
+    param($Element, [string]$Text)
+    if (-not $Element) { return $false }
+    try {
+        $Element.SetFocus()
+    } catch { }
+    try {
+        $pattern = $Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $pattern.SetValue($Text)
+        return $true
+    } catch { }
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait("^a")
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait($Text)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Find-UiaFirstEdit {
+    param($Root)
+    if (-not $Root) { return $null }
+    Initialize-Uia
+    $typeCond = New-Object System.Windows.Automation.PropertyCondition (
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+    $found = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $typeCond)
+    foreach ($el in $found) {
+        if ($el.Current.IsEnabled) { return $el }
+    }
+    return $null
+}
+
+function Test-PbiMainReportWindow {
+    param([string]$Title, [string]$ReportName)
+    if (-not $Title -or -not $ReportName) { return $false }
+    return ($Title -match [regex]::Escape($ReportName) -and $Title -match 'Power BI Desktop')
 }
 
 function Invoke-UiaElement {
@@ -406,28 +448,24 @@ function Invoke-PbiModelRefreshTom {
 function Invoke-PbiRibbonRefresh {
     param($Process, [int]$TimeoutS = 600)
     [void](Show-PbiWindow -Process $Process)
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Seconds 3
     $windows = Get-UiaWindowByPid -ProcessId $Process.Id
-    $clicked = $false
     foreach ($win in $windows) {
         if (Invoke-UiaNamed -Root $win -NamePattern '^Refresh$' -ControlTypes @("Button", "MenuItem", "SplitButton")) {
-            $clicked = $true
+            Write-Host "Clicked Desktop Refresh."
             break
         }
     }
-    if (-not $clicked) {
-        $shell = New-Object -ComObject WScript.Shell
-        [void]$shell.AppActivate($Process.Id)
-        Start-Sleep -Milliseconds 300
-        # Home ribbon keytips: Alt, H, R (Refresh) on English Desktop.
-        [System.Windows.Forms.SendKeys]::SendWait("%")
-        Start-Sleep -Milliseconds 250
-        [System.Windows.Forms.SendKeys]::SendWait("h")
-        Start-Sleep -Milliseconds 250
-        [System.Windows.Forms.SendKeys]::SendWait("r")
-        $clicked = $true
-    }
-    if (-not $clicked) { return $false }
+    # Keytips as well: Store-app UIA often "clicks" a non-ribbon Refresh.
+    $shell = New-Object -ComObject WScript.Shell
+    [void]$shell.AppActivate($Process.Id)
+    Start-Sleep -Milliseconds 400
+    [System.Windows.Forms.SendKeys]::SendWait("%")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("h")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("r")
+    Write-Host "Sent Home > Refresh (Alt+H, R). Waiting for the model to finish..."
     return Wait-PbiRefreshFinished -Process $Process -TimeoutS $TimeoutS
 }
 
@@ -436,36 +474,40 @@ function Wait-PbiRefreshFinished {
     $startedAt = Get-Date
     $deadline = $startedAt.AddSeconds($TimeoutS)
     $sawRefreshUi = $false
-    Start-Sleep -Seconds 2
+    Write-Host "Waiting for the Refresh dialog (CLV_wo_fact / Loading data) to finish..."
     do {
         $busy = $false
         foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
             $title = [string]$win.Current.Name
-            if ($title -match '(?i)^refresh$|refreshing|applying query') {
+            if ($title -match '(?i)^refresh$') {
                 $busy = $true
                 $sawRefreshUi = $true
-            }
-            $status = Find-UiaByName -Root $win -NamePattern 'refreshing|applying query|loading data' -ControlTypes @("Text", "StatusBar", "Button")
-            if ($status) {
-                $busy = $true
-                $sawRefreshUi = $true
+                $loading = Find-UiaByName -Root $win -NamePattern 'loading data|waiting for other queries' -ControlTypes @("Text", "StatusBar")
+                if ($loading) { $busy = $true }
             }
         }
         $elapsed = ((Get-Date) - $startedAt).TotalSeconds
-        if ($sawRefreshUi -and -not $busy -and $elapsed -ge 4) { return $true }
-        # Fast CSV refresh often has no modal; give the engine a few seconds.
-        if (-not $sawRefreshUi -and $elapsed -ge 12) { return $true }
-        Start-Sleep -Milliseconds 750
+        if ($sawRefreshUi -and -not $busy -and $elapsed -ge 3) {
+            Write-Host "Refresh dialog closed after $([int]$elapsed)s."
+            return $true
+        }
+        Start-Sleep -Milliseconds 600
     } while ((Get-Date) -lt $deadline)
-    return -not $sawRefreshUi
+    if ($sawRefreshUi) {
+        Write-Host "Refresh dialog was still open after ${TimeoutS}s."
+        return $false
+    }
+    Write-Host "Refresh dialog never appeared — Home > Refresh did not start."
+    return $false
 }
 
 function Invoke-PbiSave {
     param($Process)
-    if (-not (Show-PbiWindow -Process $Process)) { return $false }
-    Start-Sleep -Milliseconds 200
+    [void](Show-PbiWindow -Process $Process)
+    Start-Sleep -Milliseconds 400
     [System.Windows.Forms.SendKeys]::SendWait("^s")
-    Start-Sleep -Seconds 2
+    Write-Host "Saved PBIX (Ctrl+S)."
+    Start-Sleep -Seconds 8
     return $true
 }
 
@@ -580,17 +622,21 @@ function Invoke-PbiPublishUi {
     param(
         $Process,
         [string]$WorkspaceName,
-        [int]$TimeoutS = 180
+        [string]$ReportName = "FPSO_Inspection",
+        [int]$TimeoutS = 360
     )
+    if (-not $WorkspaceName) { $WorkspaceName = "My workspace" }
     Initialize-Uia
-    if (-not (Show-PbiWindow -Process $Process)) { return $false }
-    Start-Sleep -Milliseconds 400
-    $windows = Get-UiaWindowByPid -ProcessId $Process.Id
+    [void](Show-PbiWindow -Process $Process)
+    Start-Sleep -Milliseconds 500
     $started = $false
-    foreach ($win in $windows) {
-        if (Invoke-UiaNamed -Root $win -NamePattern '^Publish$' -ControlTypes @("Button", "MenuItem", "SplitButton", "Hyperlink")) {
-            $started = $true
-            break
+    foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
+        if (Test-PbiMainReportWindow -Title $win.Current.Name -ReportName $ReportName) {
+            if (Invoke-UiaNamed -Root $win -NamePattern '^Publish$' -ControlTypes @("Button", "MenuItem", "SplitButton", "Hyperlink")) {
+                $started = $true
+                Write-Host "Clicked Publish."
+                break
+            }
         }
     }
     if (-not $started) {
@@ -602,61 +648,87 @@ function Invoke-PbiPublishUi {
         [System.Windows.Forms.SendKeys]::SendWait("h")
         Start-Sleep -Milliseconds 250
         [System.Windows.Forms.SendKeys]::SendWait("u")
+        Write-Host "Sent Home > Publish (Alt+H, U)."
         $started = $true
     }
-    if (-not $started) { return $false }
 
     $deadline = (Get-Date).AddSeconds($TimeoutS)
+    $savedPrompt = $false
+    $searched = $false
+    $pickedWorkspace = $false
     $clickedSelect = $false
     $clickedReplace = $false
     $clickedGotIt = $false
-    $sawSuccess = $false
     while ((Get-Date) -lt $deadline) {
         foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
             $title = [string]$win.Current.Name
-            if ($title -match 'Power BI Desktop$' -and $title -notmatch '(?i)publish') {
-                continue
-            }
+            if (Test-PbiMainReportWindow -Title $title -ReportName $ReportName) { continue }
             if ($title -match '(?i)sign in') {
                 throw "Power BI Desktop is not signed in. Sign in once, then re-run."
             }
-            if ($WorkspaceName -and $title -match '(?i)publish') {
-                $item = Find-UiaByName -Root $win -NamePattern ("^" + [regex]::Escape($WorkspaceName) + "$") -ControlTypes @("ListItem", "TreeItem", "DataItem", "Text")
-                if ($item) { [void](Invoke-UiaElement -Element $item) }
-            }
-            if (-not $clickedSelect -and $title -match '(?i)publish') {
-                if (Invoke-UiaNamed -Root $win -NamePattern '^Select$') {
-                    $clickedSelect = $true
-                    Start-Sleep -Milliseconds 800
+
+            # Publish -> "Do you want to save your changes?"
+            if (-not $savedPrompt -and $title -match '(?i)Microsoft Power BI Desktop') {
+                if (Invoke-UiaNamed -Root $win -NamePattern '^Save$') {
+                    $savedPrompt = $true
+                    Write-Host "Saved changes before publish."
+                    Start-Sleep -Seconds 2
                     continue
                 }
             }
-            if (-not $clickedReplace -and (Invoke-UiaNamed -Root $win -NamePattern '^(Replace|Overwrite)$')) {
-                $clickedReplace = $true
-                Write-Host "Accepted Replace/Overwrite."
-                Start-Sleep -Seconds 2
-                continue
+
+            # "Publish to Power BI" / Select a destination. Select stays disabled
+            # until a workspace row (My workspace) is highlighted.
+            if ($title -match '(?i)publish to power bi' -or ($title -match '(?i)^publish' -and -not $clickedSelect)) {
+                if (-not $searched) {
+                    $edit = Find-UiaByName -Root $win -NamePattern 'search' -ControlTypes @("Edit")
+                    if (-not $edit) { $edit = Find-UiaFirstEdit -Root $win }
+                    if ($edit -and (Set-UiaEditValue -Element $edit -Text $WorkspaceName)) {
+                        $searched = $true
+                        Write-Host "Typed '$WorkspaceName' in the destination search box."
+                        Start-Sleep -Milliseconds 800
+                    }
+                }
+                if (-not $pickedWorkspace) {
+                    $item = Find-UiaByName -Root $win -NamePattern ("^" + [regex]::Escape($WorkspaceName) + "$") -ControlTypes @("ListItem", "TreeItem", "DataItem", "Text")
+                    if ($item -and (Invoke-UiaElement -Element $item)) {
+                        $pickedWorkspace = $true
+                        Write-Host "Selected destination '$WorkspaceName'."
+                        Start-Sleep -Milliseconds 600
+                    }
+                }
+                if ($pickedWorkspace -and -not $clickedSelect) {
+                    if (Invoke-UiaNamed -Root $win -NamePattern '^Select$') {
+                        $clickedSelect = $true
+                        Write-Host "Clicked Select."
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+                }
             }
-            if ($title -match '(?i)success|published') { $sawSuccess = $true }
-            if ($title -match '(?i)publish|success|published' -and (Invoke-UiaNamed -Root $win -NamePattern '^Got it$')) {
-                $clickedGotIt = $true
-                $sawSuccess = $true
-                Write-Host "Dismissed publish confirmation."
-                return $true
+
+            if (-not $clickedReplace -and $title -match '(?i)replace this dataset') {
+                if (Invoke-UiaNamed -Root $win -NamePattern '^Replace$') {
+                    $clickedReplace = $true
+                    Write-Host "Clicked Replace on FPSO_Inspection."
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+            }
+
+            if ($title -match '(?i)publishing to power bi|success') {
+                if (Invoke-UiaNamed -Root $win -NamePattern '^Got it$') {
+                    $clickedGotIt = $true
+                    Write-Host "Clicked Got it (publish succeeded)."
+                    return $true
+                }
             }
         }
-        if ($clickedSelect -and $clickedReplace -and -not $clickedGotIt) {
-            # Success toast can vanish on its own.
-            Start-Sleep -Seconds 2
-            $stillPrompt = $false
-            foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
-                if ([string]$win.Current.Name -match '(?i)publish|replace') { $stillPrompt = $true }
-            }
-            if (-not $stillPrompt) { return $true }
-        }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 400
     }
-    return ($sawSuccess -or $clickedReplace -or $clickedGotIt)
+    Write-Host ("Publish UI did not finish. save={0} workspace={1} select={2} replace={3} gotit={4}" -f `
+        $savedPrompt, $pickedWorkspace, $clickedSelect, $clickedReplace, $clickedGotIt)
+    return $false
 }
 
 function Close-PbiReport {
@@ -738,9 +810,10 @@ function Invoke-PbiRefreshAndPublish {
         [switch]$LeaveOpen,
         [int]$OpenTimeoutS = 180,
         [int]$RefreshTimeoutS = 600,
-        [int]$PublishTimeoutS = 180
+        [int]$PublishTimeoutS = 360
     )
     Initialize-Uia
+    if (-not $WorkspaceName) { $WorkspaceName = "My workspace" }
     $proc = Start-PbiReport -PbixPath $PbixPath -ReportName $ReportName -TimeoutS $OpenTimeoutS
     $refreshed = $false
     if (-not $SkipRefresh) {
@@ -749,6 +822,10 @@ function Invoke-PbiRefreshAndPublish {
         if (-not $refreshed) {
             Write-Host "Engine refresh unavailable; using Desktop Refresh button."
             $refreshed = Invoke-PbiRibbonRefresh -Process $proc -TimeoutS $RefreshTimeoutS
+            if (-not $refreshed) {
+                Write-Host "Retrying Desktop Refresh once..."
+                $refreshed = Invoke-PbiRibbonRefresh -Process $proc -TimeoutS $RefreshTimeoutS
+            }
         }
         if (-not $refreshed) {
             throw "Power BI refresh did not complete for $ReportName."
@@ -762,7 +839,7 @@ function Invoke-PbiRefreshAndPublish {
         $published = Publish-PbiViaRest -PbixPath $PbixPath -WorkspaceName $WorkspaceName -ReportName $ReportName -TimeoutS $PublishTimeoutS
         if (-not $published) {
             Write-Host "Publishing from Desktop (auto-confirm Replace)..."
-            $published = Invoke-PbiPublishUi -Process $proc -WorkspaceName $WorkspaceName -TimeoutS $PublishTimeoutS
+            $published = Invoke-PbiPublishUi -Process $proc -WorkspaceName $WorkspaceName -ReportName $ReportName -TimeoutS $PublishTimeoutS
         }
         if (-not $published) {
             throw "Power BI publish did not complete for $ReportName."
