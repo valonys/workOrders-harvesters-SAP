@@ -16,6 +16,7 @@ Age buckets from days overdue after the +28 grace period.
 from __future__ import annotations
 
 import csv
+import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -84,7 +85,9 @@ def build_from_table(
     """
     as_of = as_of or date.today()
     lookup = item_class_by_order or load_item_class_lookup(folder, variant)
-    table = ensure_item_class_column(table, lookup)
+    table = ensure_item_class_column(
+        table, lookup, folder=folder, site=_site_code(variant)
+    )
     # Persist Item Class into the FPSO master lookup (Site, Order, ItemClass).
     save_item_class_lookup(folder, variant, table)
     site = _site_code(variant)
@@ -338,7 +341,9 @@ def load_item_class_lookup(folder: Path, variant: str) -> Dict[str, str]:
                 site,
                 fpso.name,
             )
-    return mapping
+    from .item_class_fix import apply_to_order_map
+
+    return apply_to_order_map(mapping, folder=folder, site=site)
 
 
 def save_item_class_lookup(folder: Path, variant: str, table: convert.Table) -> Path:
@@ -491,7 +496,11 @@ def _read_lookup_csv(path: Path, site: Optional[str] = None) -> Dict[str, str]:
 
 
 def ensure_item_class_column(
-    table: convert.Table, lookup: Dict[str, str]
+    table: convert.Table,
+    lookup: Dict[str, str],
+    *,
+    folder: Optional[Path] = None,
+    site: str = "",
 ) -> convert.Table:
     """Guarantee headers start with Item Class, filled from col A or Order lookup.
 
@@ -509,6 +518,15 @@ def ensure_item_class_column(
         if _order_key(key) and str(value).strip()
     }
     new_rows: List[List[Any]] = []
+    from .item_class_fix import correct_item_class, load_rules
+
+    rules = load_rules(folder)
+
+    def _corrected(order: str, klass: str) -> str:
+        return correct_item_class(
+            order, klass, site=site, folder=folder, rules=rules
+        )
+
     if has_class:
         class_idx = next(
             i
@@ -525,10 +543,10 @@ def ensure_item_class_column(
             # Ignore leftover formula text if a cached value was not available.
             if current.upper().startswith("IFERROR") or "XLOOKUP" in current.upper():
                 current = ""
+            order = values[order_idx] if order_idx is not None else ""
             if not current and order_idx is not None:
-                values[class_idx] = clean_lookup.get(values[order_idx], "")
-            else:
-                values[class_idx] = current
+                current = clean_lookup.get(order, "")
+            values[class_idx] = _corrected(str(order or ""), current)
             new_rows.append(values)
         return convert.Table(headers=headers, rows=new_rows)
 
@@ -543,7 +561,7 @@ def ensure_item_class_column(
         )
         if order_idx is not None and order_idx < len(values):
             values[order_idx] = order
-        klass = clean_lookup.get(order, "")
+        klass = _corrected(order, clean_lookup.get(order, ""))
         new_rows.append([klass, *values])
     return convert.Table(headers=new_headers, rows=new_rows)
 
@@ -826,6 +844,8 @@ def write_combined_fpso_dataset(
                 len(rows),
                 fact_out.name,
             )
+            _mirror_clv_wo_fact(dataset_dir, fact_out)
+            _apply_item_class_safety_net(folder)
             return {"fact": fact_out, "summary": summary_out, "matrix": matrix_out}
 
     # Cold start: rebuild each site from the latest harvest workbook.
@@ -848,11 +868,40 @@ def write_combined_fpso_dataset(
         raise ExportError(
             "No FPSO dataset CSVs found. Run `python -m iw29_export iw38` first."
         )
+    _mirror_clv_wo_fact(dataset_dir, fact_out)
+    _apply_item_class_safety_net(folder)
     return {
         "fact": fact_out,
         "summary": summary_out,
         "matrix": matrix_out,
     }
+
+
+def _apply_item_class_safety_net(folder: Path) -> None:
+    """Re-apply the explicit Campaign/PV-VII mapping after a harvest rewrite."""
+    from .item_class_fix import apply_to_dataset, load_rules
+
+    if not load_rules(folder):
+        return
+    report = apply_to_dataset(folder, persist_rules=False)
+    if report.lookup_changed or report.fact_changed:
+        log.info(
+            "Item Class corrections applied: lookup %d, fact %d",
+            report.lookup_changed,
+            report.fact_changed,
+        )
+
+
+def _mirror_clv_wo_fact(dataset_dir: Path, fact_out: Path) -> None:
+    """FPSO_Inspection.pbix still queries CLV_wo_fact — keep that file in sync."""
+    if not fact_out.is_file():
+        return
+    clv = dataset_dir / "CLV_wo_fact.csv"
+    try:
+        shutil.copyfile(fact_out, clv)
+        log.info("Mirrored %s → %s (PBIX query CLV_wo_fact)", fact_out.name, clv.name)
+    except OSError as exc:
+        log.warning("Could not mirror %s: %s", clv.name, exc)
 
 
 def _fact_row_as_dict(row: Dict[str, Any]) -> Dict[str, str]:

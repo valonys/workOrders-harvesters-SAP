@@ -1,8 +1,9 @@
 @echo off
 rem End-to-end CLV IW38 pipeline for Task Scheduler:
+rem   0) Close leftover Power BI Desktop so CLV CSVs can be overwritten
 rem   1) Harvest IW39 variant CLV-PG2026
-rem   2) Rebuild dataset\CLV_*.csv (+ Item Class restore)
-rem   3) Optionally refresh the local Power BI Desktop report
+rem   2) Rebuild dataset CSVs
+rem   3) Refresh CLV_Inspection.pbix and publish/replace on the workspace
 rem
 rem Usage:
 rem   run_iw38_clv_pipeline.cmd
@@ -19,6 +20,11 @@ if exist "%ROOT%\.venv\Scripts\python.exe" (
     set "PY=python"
 )
 
+if "%REFRESH_PBI%"=="1" (
+    echo [%DATE% %TIME%] Closing Power BI Desktop so CLV CSVs can be overwritten...
+    powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_clv_powerbi.ps1" -UnlockDataset
+)
+
 echo [%DATE% %TIME%] IW38 CLV harvest starting...
 "%PY%" -m iw29_export iw38 --variants CLV-PG2026
 set "CODE=%ERRORLEVEL%"
@@ -30,10 +36,10 @@ if not "%CODE%"=="0" (
 
 echo [%DATE% %TIME%] IW38 CLV dataset refreshed.
 if "%REFRESH_PBI%"=="1" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_clv_powerbi.ps1"
+    powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_clv_powerbi.ps1"
     set "PBI_CODE=%ERRORLEVEL%"
     if not "%PBI_CODE%"=="0" (
-        echo [%DATE% %TIME%] Power BI refresh returned %PBI_CODE% ^(CSV data is still updated^)
+        echo [%DATE% %TIME%] Power BI refresh/publish returned %PBI_CODE% ^(CSV data is still updated^)
     )
 )
 

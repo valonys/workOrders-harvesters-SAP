@@ -258,6 +258,37 @@ class Iw38Config:
 
 
 @dataclass
+class SharePointAttachmentsConfig:
+    """Search a SharePoint site for Fame+/equipment tags and harvest documents."""
+
+    enabled: bool = False
+    site_url: str = ""
+    list_path: Optional[Path] = None
+    output_folder: Optional[Path] = None
+    tenant_id: str = ""  # blank = "organizations"
+    client_id: str = ""  # blank = Microsoft Graph CLI public client
+    max_results_per_tag: int = 50
+    merge_pdfs: bool = True
+    merge_keep_parts: bool = False
+    limit: int = 0
+
+
+@dataclass
+class PowerBiConfig:
+    """After IW38 harvest, refresh the local PBIX and publish to the workspace."""
+
+    # Workspace consumers already use. Blank = last workspace chosen in Desktop.
+    workspace: str = "My workspace"
+    fpso_report: str = "FPSO_Inspection"
+    clv_report: str = "CLV_Inspection"
+    publish: bool = True
+    close_after: bool = True
+    open_timeout_s: int = 180
+    refresh_timeout_s: int = 600
+    publish_timeout_s: int = 360
+
+
+@dataclass
 class RuntimeConfig:
     mock: bool = False
     log_folder: Optional[Path] = None
@@ -279,6 +310,10 @@ class Config:
         default_factory=Iw22AttachmentsConfig
     )
     iw38: Iw38Config = field(default_factory=Iw38Config)
+    sharepoint_attachments: SharePointAttachmentsConfig = field(
+        default_factory=SharePointAttachmentsConfig
+    )
+    powerbi: PowerBiConfig = field(default_factory=PowerBiConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Optional[Path] = None
 
@@ -327,6 +362,10 @@ class Config:
                 _section(data, "iw22_attachments", path)
             ),
             iw38=_build_iw38(_section(data, "iw38", path)),
+            sharepoint_attachments=_build_sharepoint_attachments(
+                _section(data, "sharepoint_attachments", path)
+            ),
+            powerbi=_build_powerbi(_section(data, "powerbi", path)),
             runtime=_build_runtime(_section(data, "runtime", path)),
             source_path=path,
         )
@@ -414,6 +453,15 @@ class Config:
                     f"iw38.mode must be one of {VALID_EXPORT_MODES}, "
                     f"got '{self.iw38.mode}'."
                 )
+        if self.sharepoint_attachments.enabled:
+            if not self.sharepoint_attachments.site_url.strip():
+                raise ConfigError(
+                    "sharepoint_attachments.site_url must be set when enabled."
+                )
+        if self.powerbi.open_timeout_s <= 0 or self.powerbi.refresh_timeout_s <= 0:
+            raise ConfigError("powerbi timeouts must be positive.")
+        if self.powerbi.publish_timeout_s <= 0:
+            raise ConfigError("powerbi.publish_timeout_s must be positive.")
         if not self.selection.transaction.strip():
             raise ConfigError("selection.transaction must be set.")
         if not str(self.export.folder).strip():
@@ -643,6 +691,27 @@ def _build_iw38(raw: Dict[str, Any]) -> Iw38Config:
     )
 
 
+def _build_sharepoint_attachments(raw: Dict[str, Any]) -> SharePointAttachmentsConfig:
+    list_path = _str(raw, "sharepoint_attachments.list_path", "").strip()
+    output = _str(raw, "sharepoint_attachments.output_folder", "").strip()
+    return SharePointAttachmentsConfig(
+        enabled=_bool(raw, "sharepoint_attachments.enabled", False),
+        site_url=_str(raw, "sharepoint_attachments.site_url", "").strip(),
+        list_path=Path(list_path).expanduser() if list_path else None,
+        output_folder=Path(output).expanduser() if output else None,
+        tenant_id=_str(raw, "sharepoint_attachments.tenant_id", "").strip(),
+        client_id=_str(raw, "sharepoint_attachments.client_id", "").strip(),
+        max_results_per_tag=_int(
+            raw, "sharepoint_attachments.max_results_per_tag", 50
+        ),
+        merge_pdfs=_bool(raw, "sharepoint_attachments.merge_pdfs", True),
+        merge_keep_parts=_bool(
+            raw, "sharepoint_attachments.merge_keep_parts", False
+        ),
+        limit=_int(raw, "sharepoint_attachments.limit", 0),
+    )
+
+
 def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
     list_path = _str(raw, "iw22_attachments.list_path", "").strip()
     output = _str(raw, "iw22_attachments.output_folder", "").strip()
@@ -702,6 +771,22 @@ def _build_iw22_attachments(raw: Dict[str, Any]) -> Iw22AttachmentsConfig:
         ),
         fill_scenario=_bool(raw, "iw22_attachments.fill_scenario", True),
         scenario_max_pages=_int(raw, "iw22_attachments.scenario_max_pages", 6),
+    )
+
+
+def _build_powerbi(raw: Dict[str, Any]) -> PowerBiConfig:
+    return PowerBiConfig(
+        workspace=_str(raw, "powerbi.workspace", "My workspace").strip()
+        or "My workspace",
+        fpso_report=_str(raw, "powerbi.fpso_report", "FPSO_Inspection").strip()
+        or "FPSO_Inspection",
+        clv_report=_str(raw, "powerbi.clv_report", "CLV_Inspection").strip()
+        or "CLV_Inspection",
+        publish=_bool(raw, "powerbi.publish", True),
+        close_after=_bool(raw, "powerbi.close_after", True),
+        open_timeout_s=_int(raw, "powerbi.open_timeout_s", 180),
+        refresh_timeout_s=_int(raw, "powerbi.refresh_timeout_s", 600),
+        publish_timeout_s=_int(raw, "powerbi.publish_timeout_s", 360),
     )
 
 

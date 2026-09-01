@@ -1,0 +1,11 @@
+﻿# Explicit Item Class remaps applied to FPSO_item_class_lookup.csv and
+# FPSO_wo_fact.csv (and again on every IW38 harvest so the fix sticks).
+# Match is Order + FromClass; already-corrected rows are left unchanged.
+#
+# Offline: add a row here, save, then set the same Order to Campaign in
+# FPSO_item_class_lookup.csv and FPSO_wo_fact.csv. Harvest re-applies this
+# file even if IW38_FR3_*-PG2026.xlsx column A still has the old class.
+Site,Order,FromClass,ToClass
+PAZ,73229911,Pressure Vessel (VII),Campaign
+PAZ,73229914,Pressure Vessel (VII),Campaign
+PAZ,73230004,Pressure Vessel (VII),Campaign

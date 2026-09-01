@@ -168,8 +168,33 @@ build_kpi = true
 DY_MAB = true
 DY_HIS = true
 
+# After IW38 harvest, refresh FPSO_Inspection.pbix and publish/replace
+# to My workspace (Select is disabled until that row is chosen).
+[powerbi]
+workspace = "My workspace"
+fpso_report = "FPSO_Inspection"
+clv_report = "CLV_Inspection"
+publish = true
+close_after = true
+open_timeout_s = 180
+refresh_timeout_s = 600
+publish_timeout_s = 360
+
 [runtime]
 mock = false                 # true = generate sample data, never touch SAP
 log_folder = ""              # blank = <project>\logs
 log_level = "INFO"
 lock_timeout_s = 0           # >0 waits for a concurrent run, 0 fails fast
+
+# Fame+ tag harvest from a SharePoint site (Microsoft Graph).
+[sharepoint_attachments]
+enabled = false
+site_url = "https://totalworkplace.sharepoint.com/sites/TEPAO-B17-FO_STP"
+list_path = ""               # e.g. ...\Fame+\GIR_Fame+Tags.txt
+output_folder = ""           # blank = ...\Fame+\sp_attachments
+tenant_id = ""               # blank = organizations; TE tenant if known
+client_id = ""               # blank = Microsoft Graph CLI public client
+max_results_per_tag = 50
+merge_pdfs = true
+merge_keep_parts = false
+limit = 0

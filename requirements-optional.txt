@@ -9,3 +9,6 @@ openpyxl>=3.1.2
 
 # Merge split IW22 attachment PDFs: notif(1).pdf + notif(2).pdf → notif.pdf
 pypdf>=4.0.0
+
+# SharePoint / Fame+ tag harvest via Microsoft Graph (device-code login)
+msal>=1.28.0

@@ -73,6 +73,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.sap.system, "FR3")
         self.assertEqual(config.selection.transaction, "IW29")
         self.assertTrue(any(f.field_name == "ARBPL" for f in config.selection.filters))
+        self.assertTrue(config.powerbi.publish)
+        self.assertEqual(config.powerbi.fpso_report, "FPSO_Inspection")
+
+    def test_powerbi_section_defaults_when_omitted(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            config = Config.load(_write_config(Path(scratch)))
+        self.assertEqual(config.powerbi.workspace, "My workspace")
+        self.assertTrue(config.powerbi.publish)
+        self.assertTrue(config.powerbi.close_after)
+        self.assertEqual(config.powerbi.clv_report, "CLV_Inspection")
 
     def test_dates_default_to_lookback_window(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -374,6 +384,75 @@ Recommendations:
             split = root / "iw22_notification_lookup_GIR.xlsx"
             self.assertTrue(split.is_file())
             self.assertIn(split, result.paths)
+
+
+class ItemClassFixTests(unittest.TestCase):
+    def test_correction_is_idempotent_and_keeps_join(self):
+        from iw29_export.item_class_fix import apply_to_dataset
+
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            dataset = folder / "dataset"
+            dataset.mkdir()
+            (dataset / "item_class_corrections.csv").write_text(
+                "Site,Order,FromClass,ToClass\n"
+                "GIR,73299999,Pressure Vessel (VII),Campaign\n",
+                encoding="utf-8",
+            )
+            (dataset / "FPSO_item_class_lookup.csv").write_text(
+                "Site,Order,ItemClass\n"
+                "GIR,73299999,Pressure Vessel (VII)\n"
+                "GIR,73166043,FU Items\n",
+                encoding="utf-8",
+            )
+            (dataset / "FPSO_wo_fact.csv").write_text(
+                "Site,ItemClass,WorkOrder,IsBacklog,IsCompleted,SECE,BacklogBucket\n"
+                "GIR,Pressure Vessel (VII),73299999,False,False,NON SECE,\n"
+                "GIR,FU Items,73166043,False,True,NON SECE,\n",
+                encoding="utf-8",
+            )
+            report = apply_to_dataset(folder, persist_rules=False)
+            self.assertEqual(report.lookup_changed, 1)
+            self.assertEqual(report.fact_changed, 1)
+            self.assertTrue(report.backups)
+            report2 = apply_to_dataset(folder, persist_rules=False)
+            self.assertEqual(report2.lookup_changed, 0)
+            self.assertEqual(report2.fact_changed, 0)
+            self.assertEqual(report2.missing_from_lookup, [])
+            self.assertEqual(report2.order_mismatches, [])
+            lookup_text = (dataset / "FPSO_item_class_lookup.csv").read_text(
+                encoding="utf-8-sig"
+            )
+            self.assertIn("Campaign", lookup_text)
+            self.assertNotIn("Pressure Vessel (VII)", lookup_text)
+
+    def test_ensure_column_overrides_workbook_value(self):
+        from iw29_export import convert, iw38_kpi
+        from iw29_export.item_class_fix import CorrectionRule, write_rules
+
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            dataset = folder / "dataset"
+            dataset.mkdir()
+            write_rules(
+                dataset / "item_class_corrections.csv",
+                [
+                    CorrectionRule(
+                        order="73299999",
+                        from_class="Pressure Vessel (VII)",
+                        to_class="Campaign",
+                        site="GIR",
+                    )
+                ],
+            )
+            table = convert.Table(
+                headers=["Item Class", "Order"],
+                rows=[["Pressure Vessel (VII)", "73299999"]],
+            )
+            out = iw38_kpi.ensure_item_class_column(
+                table, {}, folder=folder, site="GIR"
+            )
+            self.assertEqual(out.rows[0][0], "Campaign")
 
 
 if __name__ == "__main__":
