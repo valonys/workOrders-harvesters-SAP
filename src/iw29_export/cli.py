@@ -26,6 +26,7 @@ COMMANDS = (
     "iw22-lookup",
     "iw38",
     "iw38-kpi",
+    "correct-item-class",
     "sp-attachments",
     "archive",
     "gui",
@@ -44,6 +45,7 @@ commands:
   iw22-lookup         rebuild per-FPSO Excel lists with Scenario summaries
   iw38                harvest IW39 order lists for the configured PG2026 variants
   iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
+  correct-item-class  remap Campaign WOs that were stored as Pressure Vessel (VII)
   sp-attachments      search SharePoint for Fame+ tags and harvest/merge documents
   archive             only file away old reports
   gui                 open the desktop app
@@ -63,6 +65,8 @@ examples:
   iw29-export iw38                       harvest GIR+DAL+PAZ+CLV + FPSO_wo_fact.csv
   iw29-export iw38-kpi                   rebuild CLV Performance/Backlog smoke KPIs
   iw29-export iw38-kpi --variants GIR-PG2026 DAL-PG2026 PAZ-PG2026 CLV-PG2026
+  iw29-export correct-item-class --dry-run
+  iw29-export correct-item-class --orders 73232811 73234290
   iw29-export sp-attachments --tags EC511B EC830 DA973
   iw29-export archive --dry-run          show what housekeeping would do
 """
@@ -121,6 +125,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="iw38 / iw38-kpi only: limit to these variants (e.g. CLV-PG2026)",
     )
     parser.add_argument(
+        "--orders",
+        nargs="+",
+        dest="item_class_orders",
+        help="correct-item-class: work order numbers to remap",
+    )
+    parser.add_argument(
+        "--from-class",
+        default="Pressure Vessel (VII)",
+        dest="item_class_from",
+        help="correct-item-class: current Item Class to match",
+    )
+    parser.add_argument(
+        "--to-class",
+        default="Campaign",
+        dest="item_class_to",
+        help="correct-item-class: replacement Item Class",
+    )
+    parser.add_argument(
+        "--mapping",
+        type=Path,
+        dest="item_class_mapping",
+        help="correct-item-class: extra mapping CSV (Site,Order,FromClass,ToClass)",
+    )
+    parser.add_argument(
         "--tags",
         nargs="+",
         dest="sp_tags",
@@ -154,6 +182,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "iw22-lookup": _command_iw22_lookup,
         "iw38": _command_iw38,
         "iw38-kpi": _command_iw38_kpi,
+        "correct-item-class": _command_correct_item_class,
         "sp-attachments": _command_sp_attachments,
         "archive": _command_archive,
         "gui": _command_gui,
@@ -395,6 +424,47 @@ def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"Combined FPSO dataset skipped: {exc}", file=sys.stderr)
     return exit_code
+
+
+def _command_correct_item_class(config: Config, args: argparse.Namespace) -> int:
+    from . import item_class_fix
+
+    folder = config.iw38.folder or Path.home() / "IW38"
+    extra_rules = []
+    extra_paths = []
+    mapping = getattr(args, "item_class_mapping", None)
+    if mapping:
+        extra_paths.append(Path(mapping))
+    orders = getattr(args, "item_class_orders", None) or []
+    if orders:
+        extra_rules.extend(
+            item_class_fix.rules_from_orders(
+                orders,
+                from_class=args.item_class_from,
+                to_class=args.item_class_to,
+            )
+        )
+    rules = item_class_fix.merge_rules(
+        item_class_fix.load_rules(folder, extra_paths=extra_paths or None),
+        extra_rules,
+    )
+    if not rules:
+        print(
+            "No correction rules. Add rows to data/item_class_corrections.csv "
+            "(Site,Order,FromClass,ToClass) or pass --orders.",
+            file=sys.stderr,
+        )
+        return 2
+    report = item_class_fix.apply_to_dataset(
+        folder,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        extra_rules=rules,
+        persist_rules=not bool(getattr(args, "dry_run", False)),
+    )
+    print(item_class_fix.format_report(report))
+    if report.missing_from_lookup or report.order_mismatches:
+        return 1
+    return 0
 
 
 def _command_sp_attachments(config: Config, args: argparse.Namespace) -> int:

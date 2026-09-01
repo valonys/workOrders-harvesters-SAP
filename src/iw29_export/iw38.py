@@ -205,6 +205,11 @@ def _harvest_variant(
             prior = iw38_kpi._extract_item_class_map_from_xlsx(destination)
             if prior:
                 lookup.update(prior)
+                from .item_class_fix import apply_to_order_map
+
+                lookup = apply_to_order_map(
+                    lookup, folder=out_dir, site=iw38_kpi._site_code(variant)
+                )
                 progress(
                     f"{variant}: preserved {len(prior)} Item Class value(s) "
                     "from previous workbook"
@@ -214,7 +219,9 @@ def _harvest_variant(
 
     enriched = table
     if cfg.build_kpi:
-        enriched = iw38_kpi.ensure_item_class_column(table, lookup)
+        enriched = iw38_kpi.ensure_item_class_column(
+            table, lookup, folder=out_dir, site=iw38_kpi._site_code(variant)
+        )
         iw38_kpi.save_item_class_lookup(out_dir, variant, enriched)
 
     with tempfile.TemporaryDirectory(prefix="iw38-build-", dir=str(staging)) as scratch:

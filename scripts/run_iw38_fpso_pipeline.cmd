@@ -23,6 +23,9 @@ if exist "%ROOT%\.venv\Scripts\python.exe" (
 if "%REFRESH_PBI%"=="1" (
     echo [%DATE% %TIME%] Closing Power BI Desktop so FPSO CSVs can be overwritten...
     powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_fpso_powerbi.ps1" -UnlockDataset
+    if errorlevel 1 (
+        echo [%DATE% %TIME%] WARNING: could not unlock dataset / parse Power BI script. Harvest will still run.
+    )
 )
 
 echo [%DATE% %TIME%] IW38 FPSO harvest starting (GIR DAL PAZ CLV)...
@@ -36,11 +39,13 @@ if not "%CODE%"=="0" (
 
 echo [%DATE% %TIME%] IW38 FPSO dataset refreshed.
 if "%REFRESH_PBI%"=="1" (
+    echo [%DATE% %TIME%] Starting Power BI refresh/publish...
     powershell -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh_fpso_powerbi.ps1"
-    set "PBI_CODE=%ERRORLEVEL%"
-    if not "%PBI_CODE%"=="0" (
-        echo [%DATE% %TIME%] Power BI refresh/publish returned %PBI_CODE% ^(CSV data is still updated^)
+    if errorlevel 1 (
+        echo [%DATE% %TIME%] Power BI refresh/publish FAILED. CSV data is still updated. See dataset\FPSO_powerbi_last_refresh.log
+        exit /b 1
     )
+    echo [%DATE% %TIME%] Power BI refresh/publish succeeded.
 )
 
 echo [%DATE% %TIME%] FPSO pipeline done.

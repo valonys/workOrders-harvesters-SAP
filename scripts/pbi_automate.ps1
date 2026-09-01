@@ -1,4 +1,4 @@
-# Shared Power BI Desktop helper: refresh the open model from CSV, save, then
+﻿# Shared Power BI Desktop helper: refresh the open model from CSV, save, then
 # publish/replace on the workspace without a person clicking through dialogs.
 # Dot-source from refresh_fpso_powerbi.ps1 / refresh_clv_powerbi.ps1.
 
@@ -134,13 +134,14 @@ function Show-PbiWindow {
     param($Process)
     if (-not $Process) { return $false }
     try { $Process.Refresh() } catch { }
-    if ($Process.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
+    $hwnd = $Process.MainWindowHandle
+    if (-not $hwnd -or $hwnd -eq [IntPtr]::Zero) { return $false }
     Initialize-Win32Foreground
-    if ([PbiWin32]::IsIconic($Process.MainWindowHandle)) {
-        [void][PbiWin32]::ShowWindow($Process.MainWindowHandle, 9)
+    if ([PbiWin32]::IsIconic($hwnd)) {
+        [void][PbiWin32]::ShowWindow($hwnd, 9)
     }
     # Windows often denies SetForegroundWindow; UIA/SendKeys can still work.
-    [void][PbiWin32]::SetForegroundWindow($Process.MainWindowHandle)
+    [void][PbiWin32]::SetForegroundWindow($hwnd)
     return $true
 }
 
@@ -151,6 +152,8 @@ function Wait-PbiReportWindow {
         $ProcessHint = $null
     )
     $deadline = (Get-Date).AddSeconds($TimeoutS)
+    $asReadySince = $null
+    $lastLog = Get-Date
     do {
         $proc = Get-PbiProcessForReport -ReportName $ReportName
         if (-not $proc -and $ProcessHint) {
@@ -159,8 +162,27 @@ function Wait-PbiReportWindow {
         }
         if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
             $title = [string]$proc.MainWindowTitle
-            if ($title -match 'Power BI Desktop' -and $title -notmatch '(?i)opening|loading') {
+            $needle = ($ReportName -replace '\.pbix$', '')
+            $named = $needle -and $title.ToLowerInvariant().Contains($needle.ToLowerInvariant())
+            $readyUi = $title -and $title -notmatch '(?i)opening|loading'
+            # Store-app titles are often just the report name, without "Power BI Desktop".
+            if ($readyUi -and $named) {
                 return $proc
+            }
+            $port = $null
+            if ($readyUi) {
+                $port = Get-PbiLocalPort -PbiProcessId $proc.Id
+            }
+            if ($readyUi -and $port) {
+                if (-not $asReadySince) { $asReadySince = Get-Date }
+                elseif (((Get-Date) - $asReadySince).TotalSeconds -ge 20) {
+                    Write-Host "Desktop title='$title'; local AS port $port is ready. Continuing."
+                    return $proc
+                }
+            }
+            if (((Get-Date) - $lastLog).TotalSeconds -ge 15) {
+                Write-Host "Waiting for report window (title='$title' asPort=$port named=$named)..."
+                $lastLog = Get-Date
             }
         }
         Start-Sleep -Milliseconds 500
@@ -355,8 +377,12 @@ function Get-PbiBinDirectory {
                 if (Test-Path -LiteralPath $dll) { return $bin }
             } catch { }
         }
-        # Microsoft Store build: DLLs sit beside PBIDesktop.exe in WindowsApps.
-        if (Test-Path -LiteralPath (Join-Path $bin "PBIDesktop.exe")) {
+        # Microsoft Store build: DLLs may sit beside PBIDesktop.exe, but only
+        # treat this as an AS bin if the client assemblies are actually there.
+        if (
+            (Test-Path -LiteralPath (Join-Path $bin "PBIDesktop.exe")) -and
+            (Test-Path -LiteralPath (Join-Path $bin "Microsoft.AnalysisServices.Tabular.dll"))
+        ) {
             return $bin
         }
     }
@@ -380,40 +406,47 @@ function Invoke-PbiModelRefreshTom {
         return $false
     }
     Write-Host "Using Power BI bin $bin"
-
     $tabular = Join-Path $bin "Microsoft.AnalysisServices.Tabular.dll"
     $core = Join-Path $bin "Microsoft.AnalysisServices.Core.dll"
     $amo = Join-Path $bin "Microsoft.AnalysisServices.dll"
-    try {
-        Add-Type -Path $core -ErrorAction Stop
-        try { Add-Type -Path $amo -ErrorAction SilentlyContinue } catch { }
-        Add-Type -Path $tabular -ErrorAction Stop
-        $server = New-Object Microsoft.AnalysisServices.Tabular.Server
-        $server.Connect("Data Source=localhost:$port")
+    if (-not (Test-Path -LiteralPath $tabular)) {
+        Write-Host "TOM assemblies not installed next to Desktop ($tabular). Will try ribbon Refresh."
+    } else {
         try {
-            $deadline = (Get-Date).AddSeconds(60)
-            while ($server.Databases.Count -lt 1 -and (Get-Date) -lt $deadline) {
-                Start-Sleep -Seconds 2
+            Add-Type -Path $core -ErrorAction Stop
+            try { Add-Type -Path $amo -ErrorAction SilentlyContinue } catch { }
+            Add-Type -Path $tabular -ErrorAction Stop
+            $server = New-Object Microsoft.AnalysisServices.Tabular.Server
+            $server.Connect("Data Source=localhost:$port")
+            try {
+                $deadline = (Get-Date).AddSeconds(60)
+                while ($server.Databases.Count -lt 1 -and (Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 2
+                    $server.Disconnect()
+                    $server.Connect("Data Source=localhost:$port")
+                }
+                if ($server.Databases.Count -lt 1) {
+                    Write-Host "TOM connected on port $port but no database was loaded yet."
+                    return $false
+                }
+                $db = $server.Databases[0]
+                Write-Host "TOM refresh: $($db.Name)"
+                $db.Model.RequestRefresh([Microsoft.AnalysisServices.Tabular.RefreshType]::Full)
+                [void]$db.Model.SaveChanges()
+                return $true
+            } finally {
                 $server.Disconnect()
-                $server.Connect("Data Source=localhost:$port")
             }
-            if ($server.Databases.Count -lt 1) {
-                Write-Host "TOM connected on port $port but no database was loaded yet."
-                return $false
-            }
-            $db = $server.Databases[0]
-            Write-Host "TOM refresh: $($db.Name)"
-            $db.Model.RequestRefresh([Microsoft.AnalysisServices.Tabular.RefreshType]::Full)
-            [void]$db.Model.SaveChanges()
-            return $true
-        } finally {
-            $server.Disconnect()
+        } catch {
+            Write-Host "TOM refresh failed: $($_.Exception.Message)"
         }
-    } catch {
-        Write-Host "TOM refresh failed: $($_.Exception.Message)"
     }
 
     $adomd = Join-Path $bin "Microsoft.AnalysisServices.AdomdClient.dll"
+    if (-not (Test-Path -LiteralPath $adomd)) {
+        Write-Host "Adomd assembly not found ($adomd). Will try ribbon Refresh."
+        return $false
+    }
     try {
         Add-Type -Path $adomd -ErrorAction Stop
         $conn = New-Object Microsoft.AnalysisServices.AdomdClient.AdomdConnection("Data Source=localhost:$port")
@@ -449,10 +482,12 @@ function Invoke-PbiRibbonRefresh {
     param($Process, [int]$TimeoutS = 600)
     [void](Show-PbiWindow -Process $Process)
     Start-Sleep -Seconds 3
+    $clicked = $false
     $windows = Get-UiaWindowByPid -ProcessId $Process.Id
     foreach ($win in $windows) {
         if (Invoke-UiaNamed -Root $win -NamePattern '^Refresh$' -ControlTypes @("Button", "MenuItem", "SplitButton")) {
             Write-Host "Clicked Desktop Refresh."
+            $clicked = $true
             break
         }
     }
@@ -466,11 +501,15 @@ function Invoke-PbiRibbonRefresh {
     Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait("r")
     Write-Host "Sent Home > Refresh (Alt+H, R). Waiting for the model to finish..."
-    return Wait-PbiRefreshFinished -Process $Process -TimeoutS $TimeoutS
+    return Wait-PbiRefreshFinished -Process $Process -TimeoutS $TimeoutS -Clicked:$clicked
 }
 
 function Wait-PbiRefreshFinished {
-    param($Process, [int]$TimeoutS = 600)
+    param(
+        $Process,
+        [int]$TimeoutS = 600,
+        [switch]$Clicked
+    )
     $startedAt = Get-Date
     $deadline = $startedAt.AddSeconds($TimeoutS)
     $sawRefreshUi = $false
@@ -491,13 +530,21 @@ function Wait-PbiRefreshFinished {
             Write-Host "Refresh dialog closed after $([int]$elapsed)s."
             return $true
         }
+        if (-not $sawRefreshUi -and $Clicked -and $elapsed -ge 45) {
+            Write-Host "Refresh was clicked; Store-app UI did not show a Refresh dialog. Treating as started after $([int]$elapsed)s."
+            return $true
+        }
+        if (-not $sawRefreshUi -and -not $Clicked -and $elapsed -ge 90) {
+            Write-Host "Refresh dialog never appeared within 90s -- Home > Refresh did not start."
+            return $false
+        }
         Start-Sleep -Milliseconds 600
     } while ((Get-Date) -lt $deadline)
     if ($sawRefreshUi) {
         Write-Host "Refresh dialog was still open after ${TimeoutS}s."
         return $false
     }
-    Write-Host "Refresh dialog never appeared — Home > Refresh did not start."
+    Write-Host "Refresh dialog never appeared -- Home > Refresh did not start."
     return $false
 }
 
@@ -512,29 +559,44 @@ function Invoke-PbiSave {
 }
 
 function Get-PbiAccessToken {
-    if ($env:PBI_ACCESS_TOKEN) { return $env:PBI_ACCESS_TOKEN }
+    if ($env:PBI_ACCESS_TOKEN) {
+        Write-Host "Using PBI_ACCESS_TOKEN from the environment."
+        return $env:PBI_ACCESS_TOKEN
+    }
     foreach ($moduleName in @("MicrosoftPowerBIMgmt.Profile", "MicrosoftPowerBIMgmt")) {
         if (-not (Get-Module -ListAvailable -Name $moduleName)) { continue }
+        Write-Host "Trying Power BI token via $moduleName ..."
         Import-Module $moduleName -ErrorAction SilentlyContinue
         try {
             $token = Get-PowerBIAccessToken -AsString -ErrorAction Stop
             if ($token) { return ($token -replace '^Bearer\s+', '') }
-        } catch { }
+        } catch {
+            Write-Host "  Get-PowerBIAccessToken failed: $($_.Exception.Message)"
+        }
         try {
             Connect-PowerBIServiceAccount -ErrorAction Stop | Out-Null
             $token = Get-PowerBIAccessToken -AsString -ErrorAction Stop
             if ($token) { return ($token -replace '^Bearer\s+', '') }
-        } catch { }
+        } catch {
+            Write-Host "  Connect-PowerBIServiceAccount failed: $($_.Exception.Message)"
+        }
     }
     if (Get-Command az -ErrorAction SilentlyContinue) {
+        Write-Host "Trying Power BI token via Azure CLI ..."
         try {
             $json = az account get-access-token --resource https://analysis.windows.net/powerbi/api -o json 2>$null
             if ($json) {
                 $parsed = $json | ConvertFrom-Json
                 if ($parsed.accessToken) { return $parsed.accessToken }
             }
-        } catch { }
+            Write-Host "  az account get-access-token returned no token (run az login)."
+        } catch {
+            Write-Host "  az token failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Azure CLI (az) is not on PATH."
     }
+    Write-Host "No Power BI REST token available."
     return $null
 }
 
@@ -569,12 +631,16 @@ function Publish-PbiViaRest {
         $groupId = $group.id
     }
     $encoded = [uri]::EscapeDataString($ReportName)
+    $amp = '&'
+    $conflict = 'nameConflict=CreateOrOverwrite'
     if ($groupId) {
-        $uri = "https://api.powerbi.com/v1.0/myorg/groups/$groupId/imports?datasetDisplayName=$encoded&nameConflict=CreateOrOverwrite"
+        $uri = "https://api.powerbi.com/v1.0/myorg/groups/$groupId/imports?datasetDisplayName=$encoded" + $amp + $conflict
         $statusUriBase = "https://api.powerbi.com/v1.0/myorg/groups/$groupId/imports/"
+        Write-Host "REST import target: workspace '$WorkspaceName' ($groupId)"
     } else {
-        $uri = "https://api.powerbi.com/v1.0/myorg/imports?datasetDisplayName=$encoded&nameConflict=CreateOrOverwrite"
+        $uri = "https://api.powerbi.com/v1.0/myorg/imports?datasetDisplayName=$encoded" + $amp + $conflict
         $statusUriBase = "https://api.powerbi.com/v1.0/myorg/imports/"
+        Write-Host "REST import target: My workspace (no group id)"
     }
     Write-Host "Uploading $ReportName to workspace '$WorkspaceName' (replace if it exists)..."
     Add-Type -AssemblyName System.Net.Http
@@ -764,8 +830,8 @@ function Close-PbiReport {
     }
     if (-not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        Get-CimInstance Win32_Process -Filter "Name='msmdsrv.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ParentProcessId -eq $proc.Id } |
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'msmdsrv.exe' -and $_.ParentProcessId -eq $proc.Id } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     }
     Start-Sleep -Seconds 2
@@ -814,12 +880,20 @@ function Invoke-PbiRefreshAndPublish {
     )
     Initialize-Uia
     if (-not $WorkspaceName) { $WorkspaceName = "My workspace" }
+    if (-not (Test-Path -LiteralPath $PbixPath)) {
+        throw "PBIX not found: $PbixPath"
+    }
+    Write-Host "PBI start: report=$ReportName workspace='$WorkspaceName' pbix=$PbixPath"
+    Write-Host "PBI flags: skipRefresh=$SkipRefresh skipPublish=$SkipPublish leaveOpen=$LeaveOpen"
     $proc = Start-PbiReport -PbixPath $PbixPath -ReportName $ReportName -TimeoutS $OpenTimeoutS
+    Write-Host "Desktop process id=$($proc.Id) title='$($proc.MainWindowTitle)'"
     $refreshed = $false
     if (-not $SkipRefresh) {
-        Write-Host "Refreshing $ReportName from CSV sources..."
+        Write-Host "Refreshing $ReportName from CSV sources (TOM / local Analysis Services)..."
         $refreshed = Invoke-PbiModelRefreshTom -PbiProcessId $proc.Id -TimeoutS $RefreshTimeoutS
-        if (-not $refreshed) {
+        if ($refreshed) {
+            Write-Host "TOM/engine refresh started and finished."
+        } else {
             Write-Host "Engine refresh unavailable; using Desktop Refresh button."
             $refreshed = Invoke-PbiRibbonRefresh -Process $proc -TimeoutS $RefreshTimeoutS
             if (-not $refreshed) {
@@ -828,11 +902,13 @@ function Invoke-PbiRefreshAndPublish {
             }
         }
         if (-not $refreshed) {
-            throw "Power BI refresh did not complete for $ReportName."
+            throw "Power BI refresh did not start or complete for $ReportName. Check the Desktop window and CSV paths."
         }
         Write-Host "Refresh completed."
         Invoke-PbiSave -Process $proc
         Start-Sleep -Seconds 2
+    } else {
+        Write-Host "SkipRefresh set -- not calling the model refresh."
     }
     $published = $false
     if (-not $SkipPublish) {
@@ -845,6 +921,8 @@ function Invoke-PbiRefreshAndPublish {
             throw "Power BI publish did not complete for $ReportName."
         }
         Write-Host "Published $ReportName to the workspace."
+    } else {
+        Write-Host "SkipPublish set -- not uploading to the workspace."
     }
     if (-not $LeaveOpen) {
         $null = Close-PbiReport -ReportName $ReportName -SaveFirst
