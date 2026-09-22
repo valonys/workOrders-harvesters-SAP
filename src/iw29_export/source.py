@@ -51,6 +51,15 @@ _MOCK_COLUMNS = [
 _MOCK_WORK_CENTERS = ["MECH01", "ELEC02", "INST03", "UTIL04"]
 _MOCK_TYPES = ["M1", "M2", "M3"]
 _MOCK_STATUSES = ["OSNO", "NOPR OSNO", "NOCO", "OSNO MPLA"]
+_MOCK_ASSETS = ["TBR1", "GIR1", "DAL1", "PAZ1", "CLV1"]
+_MOCK_DEFECTS = ["LEAK", "CORR", "THIN", "CRACK", "PIT"]
+_MOCK_SAP_LABELS = {
+    1: "Immediate",
+    2: "Urgent",
+    3: "Intermediate",
+    4: "Low",
+    5: "Very low",
+}
 _MOCK_TEXTS = [
     "Pump vibration above limit",
     "Conveyor belt misalignment",
@@ -61,6 +70,9 @@ _MOCK_TEXTS = [
     "Hydraulic pressure loss overnight",
     "Bearing noise on drive end",
 ]
+_BASE_CASE_NOTIFICATION = "43014305"
+_BASE_CASE_DESCRIPTION = "S/PI/TBR1/FZ28/NSD/GI13-305/LEAK/CI/SK/2"
+_BASE_CASE_SAP_PRIORITY = "Intermediate"
 
 
 class MockReportSource(ReportSource):
@@ -98,14 +110,15 @@ class MockReportSource(ReportSource):
                     days=self._random.randint(0, span) if span else 0
                 )
                 required = created + timedelta(days=self._random.randint(1, 45))
+                notification, description, sap_priority = self._mock_notification(index)
                 writer.writerow(
                     [
-                        f"10{2000000 + index}",
+                        notification,
                         self._random.choice(_MOCK_TYPES),
-                        self._random.choice(_MOCK_TEXTS),
+                        description,
                         self._random.choice(self.plants),
                         self._random.choice(self.work_centers),
-                        self._random.randint(1, 4),
+                        sap_priority,
                         created.strftime("%d.%m.%Y"),
                         required.strftime("%d.%m.%Y"),
                         self._random.choice(_MOCK_STATUSES),
@@ -124,3 +137,35 @@ class MockReportSource(ReportSource):
             columns=list(_MOCK_COLUMNS),
             reported_by_sap=self.rows,
         )
+
+    def _mock_notification(self, index: int) -> tuple:
+        """First row is the documented base case; later rows mix convention vs free text."""
+        if index == 0:
+            return (
+                _BASE_CASE_NOTIFICATION,
+                _BASE_CASE_DESCRIPTION,
+                _BASE_CASE_SAP_PRIORITY,
+            )
+        inspector = self._random.randint(1, 4)
+        if self._random.random() < 0.35:
+            sap_rank = self._random.choice(
+                [rank for rank in range(1, 5) if rank != inspector] or [inspector]
+            )
+        else:
+            sap_rank = inspector
+        sap_priority = _MOCK_SAP_LABELS[sap_rank]
+        if self._random.random() < 0.12:
+            return (
+                f"10{2000000 + index}",
+                self._random.choice(_MOCK_TEXTS),
+                sap_priority,
+            )
+        asset = self._random.choice(_MOCK_ASSETS)
+        fire_zone = self._random.randint(1, 32)
+        line = self._random.randint(10, 99)
+        spool = self._random.randint(100, 999)
+        defect = self._random.choice(_MOCK_DEFECTS)
+        description = (
+            f"S/PI/{asset}/FZ{fire_zone}/NSD/GI{line}-{spool}/{defect}/CI/SK/{inspector}"
+        )
+        return f"10{2000000 + index}", description, sap_priority
