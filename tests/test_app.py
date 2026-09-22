@@ -216,7 +216,7 @@ class ParseTests(unittest.TestCase):
             )
             table = convert.read_sap_text(path)
         self.assertEqual(table.headers, ["Notification", "Work Ctr"])
-        self.assertEqual(table.rows, [[10200001, "MECH01"]])
+        self.assertEqual(table.rows, [["10200001", "MECH01"]])
 
     def test_iw29_download_shape(self):
         """What IW29 'Text with Tabs' actually produces: a page title, blank
@@ -236,7 +236,7 @@ class ParseTests(unittest.TestCase):
             table = convert.read_sap_text(path)
         self.assertEqual(table.headers, ["P", "Typ", "Created On", "Message"])
         self.assertEqual(table.row_count, 2)
-        self.assertEqual(table.rows[0], [3, "NC", date(2010, 10, 7), 13073653])
+        self.assertEqual(table.rows[0], [3, "NC", date(2010, 10, 7), "13073653"])
 
     def test_repeated_page_header_is_dropped(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -250,7 +250,7 @@ class ParseTests(unittest.TestCase):
             )
             table = convert.read_sap_text(path)
         self.assertEqual(table.row_count, 2)
-        self.assertEqual(table.rows[1], [10200002, "MECH02"])
+        self.assertEqual(table.rows[1], ["10200002", "MECH02"])
 
     def test_duplicate_headers_are_disambiguated(self):
         with tempfile.TemporaryDirectory() as scratch:

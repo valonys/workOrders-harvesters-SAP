@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import archive as archive_module
-from . import convert, credentials, dataset, files, lock, master_sync
+from . import convert, credentials, dataset, files, lock, master_sync, priority
 from .config import Config
 from .errors import Iw29Error
 from .logging_setup import get_logger
@@ -68,6 +68,8 @@ def run(
 
         extract = source.extract(staging, emit)
         table = _load_table(extract, emit)
+        emit("Harmonizing inspector priority from notification descriptions...")
+        table = priority.enrich(table)
 
         timestamp = datetime.now()
         filename = config.export.render_filename(config.sap.system, timestamp)

@@ -1,0 +1,148 @@
+-- Priority Harmonization Engine — DAX
+-- Bind every operational visual to Priority_Final. Keep SAPPriority on
+-- audit / mismatch pages only. Rank 1 is most severe.
+
+-- ---------------------------------------------------------------------------
+-- Tables expected in the model
+--   Notifications     (from iw29_dataset.csv after the Python engine, or the M query)
+--   PriorityMapping   (optional dim: SAPPriority, SAPPriorityRank, Label)
+-- ---------------------------------------------------------------------------
+
+-- Display labels for the inspector rank used as the reporting key.
+Priority Label =
+VAR r = SELECTEDVALUE ( Notifications[Priority_Final] )
+RETURN
+    SWITCH (
+        r,
+        1, "Priority 1",
+        2, "Priority 2",
+        3, "Priority 3",
+        4, "Priority 4",
+        5, "Priority 5",
+        "Unparsed"
+    )
+
+-- ---------------------------------------------------------------------------
+-- Core counts
+-- ---------------------------------------------------------------------------
+
+Notification Count =
+COUNTROWS ( Notifications )
+
+Parsed Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[ParseStatus] = "Parsed"
+)
+
+Unparsed Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[ParseStatus] <> "Parsed"
+)
+
+Misclassified Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[PriorityMismatch] = "Yes"
+)
+
+Aligned Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[PriorityMismatch] = "No"
+)
+
+-- SAP assigned a weaker (higher) rank than the inspector.
+-- Negative variance = inspector more severe = potential missed risk.
+SAP Under-Ranked Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[PriorityVariance] < 0
+)
+
+SAP Over-Ranked Count =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[PriorityVariance] > 0
+)
+
+-- ---------------------------------------------------------------------------
+-- Accuracy / drift
+-- ---------------------------------------------------------------------------
+
+Priority Accuracy % =
+DIVIDE ( [Aligned Count], [Parsed Count] )
+
+Priority Variance % =
+DIVIDE ( [Misclassified Count], [Parsed Count] )
+
+Priority Distribution Shift =
+[Priority Variance %]
+
+-- ---------------------------------------------------------------------------
+-- Risk exposure from incorrect SAP ranking
+-- ---------------------------------------------------------------------------
+
+Potential Risk Exposure =
+CALCULATE (
+    COUNTROWS ( Notifications ),
+    Notifications[PriorityVariance] < 0,
+    Notifications[Priority_Final] IN { 1, 2 }
+)
+
+Potential Risk Exposure % =
+DIVIDE ( [Potential Risk Exposure], [Parsed Count] )
+
+Avg Priority Variance =
+AVERAGEX (
+    FILTER ( Notifications, NOT ISBLANK ( Notifications[PriorityVariance] ) ),
+    Notifications[PriorityVariance]
+)
+
+-- ---------------------------------------------------------------------------
+-- Aging (days since notification / created-on date)
+-- Swap 'Created On' for the actual date column in the harvest.
+-- ---------------------------------------------------------------------------
+
+Notification Age Days =
+VAR created = SELECTEDVALUE ( Notifications[Created On] )
+RETURN
+    IF ( NOT ISBLANK ( created ), INT ( TODAY () - created ) )
+
+Aging Notifications by Final Priority =
+SUMX (
+    VALUES ( Notifications[Priority_Final] ),
+    CALCULATE ( [Notification Count] )
+)
+
+-- ---------------------------------------------------------------------------
+-- Dashboard helper tables (use as measures in visuals)
+-- ---------------------------------------------------------------------------
+
+-- 1. Notifications by Final Priority  ->  clustered bar on Priority_Final
+-- 2. SAP ≠ Inspector                  ->  filter PriorityMismatch = "Yes"
+-- 3. Priority Drift Analysis          ->  [Priority Variance %] by FireZone
+-- 4. Backlog by Inspector Priority    ->  [Notification Count] by InspectorPriority
+-- 5. Fire Zone Risk Ranking           ->  [Potential Risk Exposure] by FireZone
+-- 6. Functional Location Risk Ranking ->  same, by Functional Location
+-- 7. Aging by Final Priority          ->  average of [Notification Age Days] by Priority_Final
+-- 8. Top Mismatched Assets            ->  [Misclassified Count] by Functional Location
+
+Fire Zone Risk Rank =
+RANKX (
+    ALLSELECTED ( Notifications[FireZone] ),
+    [Potential Risk Exposure],
+    ,
+    DESC,
+    DENSE
+)
+
+Functional Location Risk Rank =
+RANKX (
+    ALLSELECTED ( Notifications[Functional Location] ),
+    [Potential Risk Exposure],
+    ,
+    DESC,
+    DENSE
+)
