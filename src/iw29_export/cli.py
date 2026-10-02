@@ -413,7 +413,7 @@ def _command_ip10(config: Config, args: argparse.Namespace) -> int:
     print(f"IP10: {filled}/{len(rows)} plan(s) with a next PlanDate -> {out_path}")
     for row in rows:
         detail = f" ({row.detail})" if row.detail else ""
-        print(f"  {row.plan},{row.plan_date}{detail}")
+        print(f"  {row.plan},{row.plan_date},{row.completion_date}{detail}")
     return 0
 
 

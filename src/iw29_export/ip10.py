@@ -1,8 +1,9 @@
 """Look up the next IP10 PlanDate for a list of maintenance plans.
 
 The recorded planDate.vbs only opens /nIP10 and scrolls the scheduling table.
-This driver enters each plan, reads PlanDate plus status, and keeps the earliest
-call that is still on or after today and is not Complete.
+This driver enters each plan, reads PlanDate, status and Completion date, and
+keeps the earliest call that is still on or after today and is not Complete,
+plus the latest Completion date on the open scheduling page.
 """
 
 from __future__ import annotations
@@ -43,13 +44,15 @@ _TABLE_ID = (
 )
 _TABLE_NAME = "SAPLIWP3TCTRL_0121"
 
-CallRow = Tuple[str, str]
+# plan date, status, completion date
+CallRow = Tuple[str, str, str]
 
 
 @dataclass
 class PlanDateResult:
     plan: str
     plan_date: str
+    completion_date: str = ""
     detail: str = ""
 
 
@@ -99,7 +102,8 @@ def next_plan_date(calls: Sequence[CallRow], today: date) -> str:
     The returned text stays in SAP's ``DD.MM.YYYY`` form. Empty when none qualify.
     """
     best: Optional[date] = None
-    for raw_date, status in calls:
+    for call in calls:
+        raw_date, status = call[0], call[1]
         if "complete" in (status or "").lower():
             continue
         parsed = parse_sap_date(raw_date)
@@ -110,15 +114,36 @@ def next_plan_date(calls: Sequence[CallRow], today: date) -> str:
     return format_sap_date(best) if best else ""
 
 
+def latest_completion_date(calls: Sequence[Sequence[str]]) -> str:
+    """Latest non-blank Completion date on the scheduling list, as DD.MM.YYYY."""
+    best: Optional[date] = None
+    for call in calls:
+        raw = call[2] if len(call) > 2 else ""
+        parsed = parse_sap_date(raw)
+        if parsed is None:
+            continue
+        if best is None or parsed > best:
+            best = parsed
+    return format_sap_date(best) if best else ""
+
+
 def write_csv(path: Path, rows: Sequence[PlanDateResult]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["Inspection Plan", "PlanDate"])
-        for row in rows:
-            writer.writerow([row.plan, row.plan_date])
+    try:
+        _write_csv(path, rows)
+    except PermissionError:
+        log.warning("Could not overwrite %s; it is open elsewhere.", path.name)
+        raise
     log.info("Wrote %d row(s) to %s", len(rows), path)
     return path
+
+
+def _write_csv(path: Path, rows: Sequence[PlanDateResult]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Inspection Plan", "PlanDate", "Completion Date"])
+        for row in rows:
+            writer.writerow([row.plan, row.plan_date, row.completion_date])
 
 
 def run(
@@ -144,13 +169,28 @@ def run(
             try:
                 calls = _read_plan(session, plan)
                 chosen = next_plan_date(calls, as_of)
+                completed = latest_completion_date(calls)
                 detail = "" if chosen else "no upcoming PlanDate"
-                log.info("%s -> %s (%d call(s))", plan, chosen or "<none>", len(calls))
+                log.info(
+                    "%s -> plan %s, completed %s (%d call(s))",
+                    plan,
+                    chosen or "<none>",
+                    completed or "<none>",
+                    len(calls),
+                )
             except Exception as exc:
                 log.exception("Failed on plan %s", plan)
                 chosen = ""
+                completed = ""
                 detail = str(exc)
-            rows.append(PlanDateResult(plan=plan, plan_date=chosen, detail=detail))
+            rows.append(
+                PlanDateResult(
+                    plan=plan,
+                    plan_date=chosen,
+                    completion_date=completed,
+                    detail=detail,
+                )
+            )
     write_csv(out_path, rows)
     return rows
 
@@ -159,13 +199,18 @@ def _mock_row(plan: str, today: date) -> PlanDateResult:
     """Stable demo calls so a list run can be checked without SAP."""
     year = today.year
     calls = [
-        (f"14.02.{year - 4}", "New start Complete"),
-        (f"15.08.{year + 3}", "New start Hold"),
-        (f"15.02.{year + 7}", "Scheduled Hold"),
+        (f"01.01.{year - 6}", "New start Complete", f"15.01.{year - 6}"),
+        (f"14.02.{year - 4}", "New start Complete", f"27.02.{year - 4}"),
+        (f"15.08.{year + 3}", "New start Hold", ""),
+        (f"15.02.{year + 7}", "Scheduled Hold", ""),
     ]
     if plan.upper().endswith("0"):
-        calls = [(f"14.02.{year - 4}", "New start Complete")]
-    return PlanDateResult(plan=plan, plan_date=next_plan_date(calls, today))
+        calls = [(f"14.02.{year - 4}", "New start Complete", f"27.02.{year - 4}")]
+    return PlanDateResult(
+        plan=plan,
+        plan_date=next_plan_date(calls, today),
+        completion_date=latest_completion_date(calls),
+    )
 
 
 def _read_plan(session: SapSession, plan: str) -> List[CallRow]:
@@ -183,7 +228,7 @@ def _read_plan(session: SapSession, plan: str) -> List[CallRow]:
             f"IP10 did not open a scheduling list for {plan}. "
             f"Status: {status.text or session.window_title() or 'no table'}"
         )
-    return _read_calls(table)
+    return _read_calls(session, table)
 
 
 def _find_plan_field(session: SapSession) -> str:
@@ -272,24 +317,56 @@ def _collect_tables(node, found: List) -> None:
         _collect_tables(child, found)
 
 
-def _read_calls(table) -> List[CallRow]:
-    # Read the open page first. Scrolling the GuiTableControl can drop the COM
-    # object, and the calls SAP shows on open are the upcoming ones.
-    rows = _read_visible_pairs(table)
-    if rows:
-        return rows
+def _read_calls(session: SapSession, table) -> List[CallRow]:
+    """Read every page. Upcoming calls are on the open page; older Completion
+    dates sit above it. Re-find the table after each scroll because the
+    GuiTableControl COM object does not survive a scrollbar change.
+    """
+    seen: List[CallRow] = []
+
+    def add(page: List[CallRow]) -> int:
+        added = 0
+        for call in page:
+            if call in seen or not any(call):
+                continue
+            seen.append(call)
+            added += 1
+        return added
+
+    add(_read_visible_pairs(table))
+    if not seen:
+        total = _int_attr(table, "RowCount")
+        visible = _int_attr(table, "VisibleRowCount") or total
+        try:
+            add(_read_visible_via_getcell(table, min(visible or total, total or visible)))
+        except Exception:
+            return seen
     total = _int_attr(table, "RowCount")
-    visible = _int_attr(table, "VisibleRowCount") or total
-    try:
-        return _read_visible_via_getcell(table, min(visible or total, total or visible))
-    except Exception:
-        return []
+    visible = _int_attr(table, "VisibleRowCount") or 8
+    position = 0
+    for _ in range(40):
+        try:
+            current = _find_table(session) or table
+            current.verticalScrollbar.position = position
+            session.wait_ready()
+            current = _find_table(session) or current
+            page = _read_visible_pairs(current)
+        except Exception:
+            log.info("Stopped paging the scheduling list at position %s", position)
+            break
+        if add(page) == 0 and position:
+            break
+        position += max(visible, 1)
+        if total and position >= total:
+            break
+    return seen
 
 
 def _read_visible_pairs(table) -> List[CallRow]:
     """PlanDate is RMIPM-NPLDA; status is TERMFELD2. Ids look like name[col,row]."""
     dates = {}
     statuses = {}
+    completions = {}
     try:
         count = int(table.Children.Count)
     except Exception:
@@ -300,7 +377,7 @@ def _read_visible_pairs(table) -> List[CallRow]:
         except Exception:
             continue
         name = _attr(child, "Name")
-        if name not in {"RMIPM-NPLDA", "TERMFELD2"}:
+        if name not in {"RMIPM-NPLDA", "TERMFELD2", "RMIPM-LRMDT"}:
             continue
         row = _visible_row(child)
         if row is None:
@@ -308,11 +385,15 @@ def _read_visible_pairs(table) -> List[CallRow]:
         text = _attr(child, "Text")
         if name == "RMIPM-NPLDA":
             dates[row] = text
+        elif name == "RMIPM-LRMDT":
+            completions[row] = text
         else:
             statuses[row] = text
     pairs: List[CallRow] = []
-    for row in sorted(set(dates) | set(statuses)):
-        pairs.append((dates.get(row, ""), statuses.get(row, "")))
+    for row in sorted(set(dates) | set(statuses) | set(completions)):
+        pairs.append(
+            (dates.get(row, ""), statuses.get(row, ""), completions.get(row, ""))
+        )
     return pairs
 
 
@@ -326,14 +407,16 @@ def _visible_row(node) -> Optional[int]:
 def _read_visible_via_getcell(table, count: int) -> List[CallRow]:
     date_col = _column_index(table, "plandate", "plan date")
     status_col = _column_index(table, "scheduling type", "status")
+    done_col = _column_index(table, "completion")
     if date_col is None:
         date_col = 1
     rows: List[CallRow] = []
     for offset in range(count):
         raw_date = _cell_text(table, offset, date_col)
         status = _cell_text(table, offset, status_col) if status_col is not None else ""
-        if raw_date or status:
-            rows.append((raw_date, status))
+        completed = _cell_text(table, offset, done_col) if done_col is not None else ""
+        if raw_date or status or completed:
+            rows.append((raw_date, status, completed))
     return rows
 
 

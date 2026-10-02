@@ -1,7 +1,8 @@
 # IP10 lookahead input. One maintenance plan per line.
 # Blank lines and lines starting with # are ignored.
 # Paste the plans below this header, save the file, then ask for the harvest.
-# Result will be data/ip10_plan_dates.csv with columns: Inspection Plan,PlanDate
+# Result will be data/ip10_plan_dates.csv
+# columns: Inspection Plan, PlanDate, Completion Date
 #
 # Example (delete or replace before the run):
 # 12345678
