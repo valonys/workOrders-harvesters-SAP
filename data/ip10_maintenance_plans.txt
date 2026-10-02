@@ -1,0 +1,18 @@
+# IP10 lookahead input. One maintenance plan per line.
+# Blank lines and lines starting with # are ignored.
+# Paste the plans below this header, save the file, then ask for the harvest.
+# Result will be data/ip10_plan_dates.csv with columns: Inspection Plan,PlanDate
+#
+# Example (delete or replace before the run):
+# 12345678
+ACPSV31153A
+ACPSV54253A
+ACPSV54263A
+ACPSV70107A
+ACPSV74260A
+ACPSV10321A
+ACPSV54254B
+ACPSV30110A1
+ACPSDR1481
+ACPSDR1535
+

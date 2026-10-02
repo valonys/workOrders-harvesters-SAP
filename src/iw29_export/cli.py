@@ -26,6 +26,7 @@ COMMANDS = (
     "iw22-lookup",
     "iw38",
     "iw38-kpi",
+    "ip10",
     "correct-item-class",
     "sp-attachments",
     "archive",
@@ -44,6 +45,7 @@ commands:
   iw22-merge-pdfs     merge notif(1).pdf + (2).pdf + … into notif.pdf per batch folder
   iw22-lookup         rebuild per-FPSO Excel lists with Scenario summaries
   iw38                harvest IW39 order lists for the configured PG2026 variants
+  ip10                next IP10 PlanDate for each maintenance plan in a text list
   iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
   correct-item-class  remap Campaign WOs that were stored as Pressure Vessel (VII)
   sp-attachments      search SharePoint for Fame+ tags and harvest/merge documents
@@ -125,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="iw38 / iw38-kpi only: limit to these variants (e.g. CLV-PG2026)",
     )
     parser.add_argument(
+        "--list",
+        type=Path,
+        dest="ip10_list",
+        help="ip10 only: maintenance plan list (.txt, one id per line)",
+    )
+    parser.add_argument(
         "--orders",
         nargs="+",
         dest="item_class_orders",
@@ -182,6 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "iw22-lookup": _command_iw22_lookup,
         "iw38": _command_iw38,
         "iw38-kpi": _command_iw38_kpi,
+        "ip10": _command_ip10,
         "correct-item-class": _command_correct_item_class,
         "sp-attachments": _command_sp_attachments,
         "archive": _command_archive,
@@ -392,6 +401,20 @@ def _command_iw38(config: Config, args: argparse.Namespace) -> int:
         detail = f" ({item.detail})" if item.detail else ""
         print(f"  [{item.status}] {item.variant}{where}{detail}")
     return 1 if result.failed and result.saved == 0 else 0
+
+
+def _command_ip10(config: Config, args: argparse.Namespace) -> int:
+    from . import ip10
+
+    list_path = args.ip10_list or ip10.DEFAULT_LIST
+    out_path = args.out or ip10.DEFAULT_OUT
+    rows = ip10.run(config, list_path, out_path)
+    filled = sum(1 for row in rows if row.plan_date)
+    print(f"IP10: {filled}/{len(rows)} plan(s) with a next PlanDate -> {out_path}")
+    for row in rows:
+        detail = f" ({row.detail})" if row.detail else ""
+        print(f"  {row.plan},{row.plan_date}{detail}")
+    return 0
 
 
 def _command_iw38_kpi(config: Config, args: argparse.Namespace) -> int:
