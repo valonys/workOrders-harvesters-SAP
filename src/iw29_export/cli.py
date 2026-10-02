@@ -27,6 +27,7 @@ COMMANDS = (
     "iw38",
     "iw38-kpi",
     "correct-item-class",
+    "filter-check",
     "sp-attachments",
     "archive",
     "gui",
@@ -46,6 +47,7 @@ commands:
   iw38                harvest IW39 order lists for the configured PG2026 variants
   iw38-kpi            rebuild Performance/Backlog KPI workbook from the latest harvest
   correct-item-class  remap Campaign WOs that were stored as Pressure Vessel (VII)
+  filter-check        audit FPSO CSVs for slicer-breaking keys (spaces/case/orphans)
   sp-attachments      search SharePoint for Fame+ tags and harvest/merge documents
   archive             only file away old reports
   gui                 open the desktop app
@@ -67,6 +69,7 @@ examples:
   iw29-export iw38-kpi --variants GIR-PG2026 DAL-PG2026 PAZ-PG2026 CLV-PG2026
   iw29-export correct-item-class --dry-run
   iw29-export correct-item-class --orders 73232811 73234290
+  iw29-export filter-check                audit FPSO_wo_fact vs lookup for slicer breaks
   iw29-export sp-attachments --tags EC511B EC830 DA973
   iw29-export archive --dry-run          show what housekeeping would do
 """
@@ -183,6 +186,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "iw38": _command_iw38,
         "iw38-kpi": _command_iw38_kpi,
         "correct-item-class": _command_correct_item_class,
+        "filter-check": _command_filter_check,
         "sp-attachments": _command_sp_attachments,
         "archive": _command_archive,
         "gui": _command_gui,
@@ -465,6 +469,15 @@ def _command_correct_item_class(config: Config, args: argparse.Namespace) -> int
     if report.missing_from_lookup or report.order_mismatches:
         return 1
     return 0
+
+
+def _command_filter_check(config: Config, args: argparse.Namespace) -> int:
+    from . import pbi_filter_check
+
+    del args
+    folder = config.iw38.folder or Path.home() / "IW38"
+    _, exit_code = pbi_filter_check.run(folder=folder)
+    return exit_code
 
 
 def _command_sp_attachments(config: Config, args: argparse.Namespace) -> int:

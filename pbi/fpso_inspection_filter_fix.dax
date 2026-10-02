@@ -1,0 +1,91 @@
+-- FPSO_Inspection slicer fix — filter-safe measures.
+-- Paste into the PBIX model. Assumes the star schema from
+-- pbi/fpso_inspection_filter_fix.pq.m:
+--   Fact (FPSO_wo_fact.csv) relationships (single direction, Dim -> Fact):
+--   DimSite[Site] -> Fact[Site]
+--   DimItemClass[ItemClass] -> Fact[ItemClass]
+--   DimStatus[StatusPrimary] -> Fact[StatusPrimary]
+-- Slicers must use the Dim columns, never the Fact columns.
+--
+-- Rules enforced here:
+-- - No ALL / ALLEXCEPT / REMOVEFILTERS over slicer columns.
+-- - Totals use the fact table so slicer context is preserved.
+-- - Card/label measures use HASONEVALUE so multi-select reads "(All)"
+--   instead of blank (which looks like the filter "reverted").
+
+-- ---------------------------------------------------------------------------
+-- Core counts (slicer-preserving)
+-- ---------------------------------------------------------------------------
+
+Total WOs =
+COUNTROWS ( Fact )
+
+Completed WOs =
+CALCULATE (
+    COUNTROWS ( Fact ),
+    Fact[IsCompleted] = TRUE ()
+)
+
+Backlog WOs =
+CALCULATE (
+    COUNTROWS ( Fact ),
+    Fact[IsBacklog] = TRUE ()
+)
+
+Performance % =
+DIVIDE ( [Completed WOs], [Total WOs] )
+
+SECE Backlog =
+CALCULATE (
+    [Backlog WOs],
+    Fact[SECE] = "SECE"
+)
+
+-- ---------------------------------------------------------------------------
+-- Selection helpers (put these on cards next to the slicers)
+-- ---------------------------------------------------------------------------
+
+Selected Site =
+IF (
+    HASONEVALUE ( DimSite[Site] ),
+    VALUES ( DimSite[Site] ),
+    "(All)"
+)
+
+Selected Item Class =
+IF (
+    HASONEVALUE ( DimItemClass[ItemClass] ),
+    VALUES ( DimItemClass[ItemClass] ),
+    "(All)"
+)
+
+Selected Status =
+IF (
+    HASONEVALUE ( DimStatus[StatusPrimary] ),
+    VALUES ( DimStatus[StatusPrimary] ),
+    "(All)"
+)
+
+Has ItemClass Selection =
+IF (
+    ISFILTERED ( DimItemClass[ItemClass] ),
+    1,
+    0
+)
+
+-- ---------------------------------------------------------------------------
+-- Filtered detail (use for the work-order table visual)
+-- ---------------------------------------------------------------------------
+
+Filtered WO Count =
+COUNTROWS ( Fact )
+
+-- ---------------------------------------------------------------------------
+-- Anti-patterns that cause "reverts to All" — do NOT use these:
+--   CALCULATE ( ..., ALL ( DimItemClass ) )            -- wipes the slicer
+--   CALCULATE ( ..., ALLEXCEPT ( Fact, Fact[Site] ) )  -- wipes other slicers
+--   CALCULATE ( ..., REMOVEFILTERS ( DimSite ) )       -- wipes the slicer
+-- If a % of total is needed, scope it explicitly, e.g.:
+--   % of All Sites = DIVIDE ( [Total WOs],
+--       CALCULATE ( [Total WOs], REMOVEFILTERS ( DimSite ) ) )
+-- and never put that measure on a visual that must stay filtered.
