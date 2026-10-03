@@ -455,5 +455,63 @@ class ItemClassFixTests(unittest.TestCase):
             self.assertEqual(out.rows[0][0], "Campaign")
 
 
+class Ip10LookaheadTests(unittest.TestCase):
+    def test_next_date_skips_complete_history(self):
+        from datetime import date
+
+        from iw29_export.ip10 import next_plan_date
+
+        calls = [
+            ("14.02.2022", "New start Complete"),
+            ("15.08.2029", "New start Hold"),
+            ("15.02.2033", "Scheduled Hold"),
+            ("15.08.2036", "Scheduled Hold"),
+            ("15.02.2038", "Scheduled Hold"),
+        ]
+        self.assertEqual(next_plan_date(calls, date(2026, 10, 2)), "15.08.2029")
+
+    def test_latest_completion_ignores_blanks(self):
+        from iw29_export.ip10 import latest_completion_date
+
+        calls = [
+            ("14.02.2022", "New start Complete", "27.02.2022"),
+            ("15.08.2029", "New start Hold", ""),
+            ("06.01.2027", "New start Complete", "26.01.2026"),
+        ]
+        self.assertEqual(latest_completion_date(calls), "26.01.2026")
+
+    def test_list_of_five_writes_two_column_csv(self):
+        from datetime import date
+
+        from iw29_export.ip10 import load_plans, run
+
+        config = load_config_from_text("[runtime]\nmock = true\n")
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            listing = folder / "plans.txt"
+            listing.write_text(
+                "# header\n"
+                "ACPSV31153A\n"
+                "ACPSV54253A\n"
+                "ACPSV54263A\n"
+                "ACPSV70107A\n"
+                "ACPSV00000\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(len(load_plans(listing)), 5)
+            out = folder / "ip10_plan_dates.csv"
+            rows = run(config, listing, out, today=date(2026, 10, 2))
+            text = out.read_text(encoding="utf-8-sig")
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(text.startswith("Inspection Plan,PlanDate,Completion Date"))
+        self.assertEqual(len(text.splitlines()), 6)
+        dated = [row for row in rows if row.plan != "ACPSV00000"]
+        self.assertTrue(all(row.plan_date == "15.08.2029" for row in dated))
+        self.assertTrue(all(row.completion_date == "27.02.2022" for row in dated))
+        history = next(row for row in rows if row.plan == "ACPSV00000")
+        self.assertEqual(history.plan_date, "")
+        self.assertEqual(history.completion_date, "27.02.2022")
+
+
 if __name__ == "__main__":
     unittest.main()

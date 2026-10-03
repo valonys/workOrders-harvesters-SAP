@@ -271,7 +271,10 @@ function Find-UiaFirstEdit {
 function Test-PbiMainReportWindow {
     param([string]$Title, [string]$ReportName)
     if (-not $Title -or -not $ReportName) { return $false }
-    return ($Title -match [regex]::Escape($ReportName) -and $Title -match 'Power BI Desktop')
+    $needle = [regex]::Escape($ReportName)
+    if ($Title -notmatch $needle) { return $false }
+    # Store-app titles are often just the report name, without "Power BI Desktop".
+    return ($Title -match 'Power BI Desktop' -or $Title -match ("^" + $needle + '( - Power BI)?$'))
 }
 
 function Invoke-UiaElement {
@@ -697,7 +700,8 @@ function Invoke-PbiPublishUi {
     Start-Sleep -Milliseconds 500
     $started = $false
     foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
-        if (Test-PbiMainReportWindow -Title $win.Current.Name -ReportName $ReportName) {
+        $title = [string]$win.Current.Name
+        if (Test-PbiMainReportWindow -Title $title -ReportName $ReportName -or $title -match [regex]::Escape($ReportName)) {
             if (Invoke-UiaNamed -Root $win -NamePattern '^Publish$' -ControlTypes @("Button", "MenuItem", "SplitButton", "Hyperlink")) {
                 $started = $true
                 Write-Host "Clicked Publish."
@@ -728,13 +732,13 @@ function Invoke-PbiPublishUi {
     while ((Get-Date) -lt $deadline) {
         foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
             $title = [string]$win.Current.Name
-            if (Test-PbiMainReportWindow -Title $title -ReportName $ReportName) { continue }
+            $isMain = Test-PbiMainReportWindow -Title $title -ReportName $ReportName
             if ($title -match '(?i)sign in') {
                 throw "Power BI Desktop is not signed in. Sign in once, then re-run."
             }
 
             # Publish -> "Do you want to save your changes?"
-            if (-not $savedPrompt -and $title -match '(?i)Microsoft Power BI Desktop') {
+            if (-not $isMain -and -not $savedPrompt -and $title -match '(?i)Microsoft Power BI Desktop') {
                 if (Invoke-UiaNamed -Root $win -NamePattern '^Save$') {
                     $savedPrompt = $true
                     Write-Host "Saved changes before publish."
@@ -743,12 +747,17 @@ function Invoke-PbiPublishUi {
                 }
             }
 
-            # "Publish to Power BI" / Select a destination. Select stays disabled
-            # until a workspace row (My workspace) is highlighted.
-            if ($title -match '(?i)publish to power bi' -or ($title -match '(?i)^publish' -and -not $clickedSelect)) {
+            # Store-app publish flyout lives inside the main window; the title
+            # stays FPSO_Inspection. Only type into an edit named Search.
+            $looksLikePublish = (
+                $isMain -or
+                $title -match '(?i)publish to power bi' -or
+                ($title -match '(?i)^publish' -and -not $clickedSelect)
+            )
+            if ($looksLikePublish -and -not $clickedSelect) {
                 if (-not $searched) {
                     $edit = Find-UiaByName -Root $win -NamePattern 'search' -ControlTypes @("Edit")
-                    if (-not $edit) { $edit = Find-UiaFirstEdit -Root $win }
+                    if (-not $edit -and -not $isMain) { $edit = Find-UiaFirstEdit -Root $win }
                     if ($edit -and (Set-UiaEditValue -Element $edit -Text $WorkspaceName)) {
                         $searched = $true
                         Write-Host "Typed '$WorkspaceName' in the destination search box."
@@ -773,7 +782,11 @@ function Invoke-PbiPublishUi {
                 }
             }
 
-            if (-not $clickedReplace -and $title -match '(?i)replace this dataset') {
+            $replaceRoot = (-not $isMain -or $clickedSelect)
+            if ($replaceRoot -and -not $clickedReplace -and (
+                    $title -match '(?i)replace this dataset' -or
+                    (Find-UiaByName -Root $win -NamePattern '^Replace$' -ControlTypes @("Button", "Hyperlink"))
+                )) {
                 if (Invoke-UiaNamed -Root $win -NamePattern '^Replace$') {
                     $clickedReplace = $true
                     Write-Host "Clicked Replace on FPSO_Inspection."
@@ -782,7 +795,10 @@ function Invoke-PbiPublishUi {
                 }
             }
 
-            if ($title -match '(?i)publishing to power bi|success') {
+            if ($clickedSelect -and (
+                    $title -match '(?i)publishing to power bi|success' -or
+                    (Find-UiaByName -Root $win -NamePattern '^Got it$' -ControlTypes @("Button", "Hyperlink"))
+                )) {
                 if (Invoke-UiaNamed -Root $win -NamePattern '^Got it$') {
                     $clickedGotIt = $true
                     Write-Host "Clicked Got it (publish succeeded)."
@@ -794,6 +810,11 @@ function Invoke-PbiPublishUi {
     }
     Write-Host ("Publish UI did not finish. save={0} workspace={1} select={2} replace={3} gotit={4}" -f `
         $savedPrompt, $pickedWorkspace, $clickedSelect, $clickedReplace, $clickedGotIt)
+    $titles = @()
+    foreach ($win in Get-UiaWindowByPid -ProcessId $Process.Id) {
+        $titles += [string]$win.Current.Name
+    }
+    if ($titles) { Write-Host ("Open windows: " + ($titles -join " | ")) }
     return $false
 }
 
